@@ -47,6 +47,20 @@ _MIN_ROWS_FOR_PERIOD: dict[str, int] = {
 def _min_rows_for_period(period: str) -> int:
     return _MIN_ROWS_FOR_PERIOD.get((period or "").lower(), 0)
 
+
+# Yahoo 區間：分鐘／小時級 K 線必須保留索引時刻（不可 normalize 成純日期）
+_INTRADAY_INTERVALS = frozenset({"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"})
+
+
+def is_intraday_interval(interval: str) -> bool:
+    return (interval or "").strip().lower() in _INTRADAY_INTERVALS
+
+
+def _effective_min_rows(period: str, interval: str) -> int:
+    """分 K 資料長度落差大；略過最短根數門檻，避免快取／重試誤判。"""
+    return 0 if is_intraday_interval(interval) else _min_rows_for_period(period)
+
+
 # 抑制 yfinance 自身的錯誤訊息（例如某些代號的 'NoneType' object is not subscriptable）。
 # 我們本來就會把抓不到的代號收進「失敗清單」回傳給 UI / CLI。
 for _name in ("yfinance", "yfinance.utils", "yfinance.scrapers", "yfinance.scrapers.history"):
@@ -92,7 +106,7 @@ def _read_cache(
             return None
         # 若資料明顯比 period 預期還短（之前 yfinance 偶發只回片段），
         # 視為髒快取觸發重抓；這也是「MA200 / 短期訊號突然不見」最常見的源頭。
-        min_rows = _min_rows_for_period(period)
+        min_rows = _effective_min_rows(period, interval)
         if min_rows and len(df) < min_rows:
             return None
         df.index = pd.to_datetime(df.index)
@@ -105,7 +119,7 @@ def _write_cache(
     symbol: str, period: str, interval: str, auto_adjust: bool, df: pd.DataFrame
 ) -> None:
     # 拒絕寫入明顯片段化的結果，避免下一次讀到不完整資料。
-    min_rows = _min_rows_for_period(period)
+    min_rows = _effective_min_rows(period, interval)
     if min_rows and len(df) < min_rows:
         return
     data_p, meta_p = _cache_paths(symbol, period, interval, auto_adjust)
@@ -159,7 +173,7 @@ def _with_retry(fn: Callable, *, attempts: int = 3, base_sleep: float = 0.7):
     return None
 
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_columns(df: pd.DataFrame, *, strip_calendar_day_only: bool = True) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
@@ -207,7 +221,10 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             idx = idx.tz_convert(None)
         except (TypeError, AttributeError):
             idx = idx.tz_localize(None)
-    df.index = idx.normalize()  # 去掉 hh:mm:ss 部分，純日期對齊
+    if strip_calendar_day_only:
+        df.index = idx.normalize()  # 日線：對齊到日
+    else:
+        df.index = idx  # 分／小時 K：保留時刻以便繪圖
     return df
 
 
@@ -228,6 +245,8 @@ def fetch_history(
     if not sym:
         return pd.DataFrame()
 
+    strip_cal = not is_intraday_interval(interval)
+
     if use_cache:
         cached = _read_cache(sym, period, interval, auto_adjust, ttl_secs)
         if cached is not None:
@@ -244,13 +263,13 @@ def fetch_history(
             threads=False,
             group_by="column",
         )
-        return _normalize_columns(df)
+        return _normalize_columns(df, strip_calendar_day_only=strip_cal)
 
     def _do_ticker() -> pd.DataFrame:
         # 部分台股 ETF（例如 00919.TW）走 download() 容易丟 internal None；
         # 改用 Ticker.history() 通常較穩。
         df = yf.Ticker(sym).history(period=period, interval=interval, auto_adjust=auto_adjust)
-        return _normalize_columns(df)
+        return _normalize_columns(df, strip_calendar_day_only=strip_cal)
 
     df = pd.DataFrame()
     try:
@@ -261,7 +280,7 @@ def fetch_history(
         df = pd.DataFrame()
 
     # 若結果為空、或明顯比 period 預期短（片段資料），改用 Ticker.history() 再試。
-    min_rows = _min_rows_for_period(period)
+    min_rows = _effective_min_rows(period, interval)
     if df.empty or (min_rows and len(df) < min_rows):
         try:
             out2 = _with_retry(_do_ticker, attempts=2)

@@ -4,7 +4,7 @@ Plotly 走勢圖（深色主題）：
 - 副圖一：成交量（量柱配合 K 線顏色）
 - 副圖二：MACD（柱 + DIF + 訊號線）
 - 副圖三：RSI(14)（含 30/50/70 參考）
-- 時間軸範圍按鈕（1M/3M/6M/YTD/1Y/Max）+ log 切換 + 跨子圖十字游標
+- 視窗範圍由 App 側「圖表與區間」（expander）選擇並以 xaxis range 套用；不使用 Plotly 頂端 rangeselector（避免與 UI 重複）。
 
 注意：基準對照走「主圖右側軸（secondary_y）」，必須由 make_subplots 的 specs 預先聲明，
 不能事後 update_layout(yaxis2=...) — 否則會與成交量副圖的 yaxis2 撞名導致畫面崩壞。
@@ -78,6 +78,54 @@ def _color_for_ma(period: int, idx: int) -> tuple[str, str]:
     return (_MA_COLORS[idx % len(_MA_COLORS)], "solid")
 
 
+def x_visible_range(
+    index: pd.Index | pd.DatetimeIndex,
+    preset: str,
+) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """
+    依索引最後時刻回溯可視區間（含分 K）。preset=all 不加限制。
+    若資料區間本身就短於預設，自動裁切到資料起點。
+    """
+    p = (preset or "all").strip().lower()
+    if not len(index):
+        return None
+    if p in ("all", "max", ""):
+        return None
+    ix = pd.to_datetime(index)
+    start_data_ts = pd.Timestamp(ix[0])
+    end_ts = pd.Timestamp(ix[-1])
+
+    def clip(st: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp]:
+        if st < start_data_ts:
+            st = start_data_ts
+        if st >= end_ts:
+            st = end_ts - pd.Timedelta(nanoseconds=1)
+        return st, end_ts
+
+    if p == "ytd":
+        st = pd.Timestamp(year=int(end_ts.year), month=1, day=1)
+        return clip(st)
+
+    delta_map: dict[str, pd.Timedelta] = {
+        "last_4h": pd.Timedelta(hours=4),
+        "last_8h": pd.Timedelta(hours=8),
+        "last_24h": pd.Timedelta(days=1),
+        "last_3d": pd.Timedelta(days=3),
+        "last_5d": pd.Timedelta(days=5),
+        "last_2w": pd.Timedelta(weeks=2),
+        "last_1mo": pd.Timedelta(days=31),
+        "last_3mo": pd.Timedelta(days=92),
+        "last_6mo": pd.Timedelta(days=184),
+        "last_1y": pd.Timedelta(days=365),
+        "last_2y": pd.Timedelta(days=730),
+        "last_5y": pd.Timedelta(days=365 * 5 + 2),
+        "last_10y": pd.Timedelta(days=365 * 10 + 2),
+    }
+    if p not in delta_map:
+        return None
+    return clip(end_ts - delta_map[p])
+
+
 def build_ohlcv_figure(
     df: pd.DataFrame,
     symbol: str,
@@ -94,6 +142,10 @@ def build_ohlcv_figure(
     entry_dates: list | None = None,
     exit_dates: list | None = None,
     strategy_label: str | None = None,
+    bars_title_line: str = "日線 · OHLC",
+    xrange_preset: str = "all",
+    apply_x_visible_range: bool = True,
+    uirevision: str | None = None,
 ) -> go.Figure:
     need = {"open", "high", "low", "close", "volume"}
     if not need.issubset(set(df.columns)):
@@ -112,7 +164,7 @@ def build_ohlcv_figure(
     # 排版
     rows = 1 + (1 if "volume" in d.columns else 0) + (1 if show_macd else 0) + (1 if show_rsi else 0)
     row_heights = [0.46]
-    title_main = f"{symbol} 日線 · OHLC"
+    title_main = f"{symbol} · {bars_title_line}"
     if strategy_label:
         title_main += f"　·　策略：{strategy_label}"
     titles = [title_main]
@@ -316,11 +368,14 @@ def build_ohlcv_figure(
         plot_bgcolor="#131722",
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
+        dragmode="pan",
+        uirevision=(uirevision if uirevision else "chart"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=11)),
         margin=dict(l=52, r=52, t=56, b=40),
         font=dict(color="#d1d4dc"),
         bargap=0.15,
     )
+    fig.update_xaxes(fixedrange=False)
     fig.update_xaxes(
         showgrid=True, gridcolor="rgba(42,46,57,0.9)", zeroline=False,
         showspikes=True, spikemode="across", spikesnap="cursor",
@@ -335,22 +390,16 @@ def build_ohlcv_figure(
     if log_scale:
         fig.update_yaxes(type="log", row=1, col=1, secondary_y=False)
 
-    fig.update_xaxes(
-        rangeselector=dict(
-            buttons=[
-                dict(count=1, label="1M", step="month", stepmode="backward"),
-                dict(count=3, label="3M", step="month", stepmode="backward"),
-                dict(count=6, label="6M", step="month", stepmode="backward"),
-                dict(label="YTD", step="year", stepmode="todate"),
-                dict(count=1, label="1Y", step="year", stepmode="backward"),
-                dict(label="Max", step="all"),
-            ],
-            bgcolor="rgba(255,255,255,0.05)",
-            activecolor="rgba(255,213,79,0.4)",
-            font=dict(color="#d1d4dc", size=11),
-            x=0, y=1.18,
-        ),
-        row=1, col=1,
-    )
+    # 只在「區間設定變動」的那一輪套上初始 x range；後續 Streamlit rerun 不重送 range，
+    # 否則每互動都把 Plotly 的縮放打回預設，捲輪／框選縮放會像壞掉。
+    xr = x_visible_range(d.index, xrange_preset)
+    if apply_x_visible_range and xr is not None:
+        a, b = xr
+        fig.update_xaxes(
+            range=[a.isoformat(), b.isoformat()],
+            row=1, col=1,
+            autorange=False,
+            fixedrange=False,
+        )
 
     return fig

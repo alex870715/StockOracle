@@ -278,10 +278,25 @@ def run_full_report(
     bench_us_close = bench_us_df["close"] if not bench_us_df.empty else pd.Series(dtype=float)
     bench_tw_close = bench_tw_df["close"] if not bench_tw_df.empty else pd.Series(dtype=float)
 
-    frames, failed = fetch_watchlist(syms, period=period, progress_cb=progress_cb)
+    T = len(syms)
+    frames: dict[str, pd.DataFrame] = {}
+    failed: list[str] = []
+
+    if progress_cb:
+        den_prog = max(1, 2 * T)
+
+        def _fetch_cb(cur: int, tot: int, sym: str, ok: bool) -> None:
+            try:
+                progress_cb(cur, den_prog, sym, ok)
+            except Exception:
+                pass
+
+        frames, failed = fetch_watchlist(syms, period=period, progress_cb=_fetch_cb)
+    else:
+        frames, failed = fetch_watchlist(syms, period=period, progress_cb=None)
 
     rows: list[dict] = []
-    for sym, df in frames.items():
+    for j, (sym, df) in enumerate(frames.items(), 1):
         bench_close = (
             bench_tw_close
             if benchmark_for_symbol(sym) == "^TWII"
@@ -290,6 +305,11 @@ def run_full_report(
         snap = build_symbol_snapshot(sym, df, bench_close=bench_close if not bench_close.empty else None)
         if snap:
             rows.append(snap)
+        if progress_cb:
+            try:
+                progress_cb(T + j, den_prog, sym, bool(snap))
+            except Exception:
+                pass
 
     if not rows:
         return pd.DataFrame(), pd.DataFrame(), failed, {

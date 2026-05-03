@@ -3,7 +3,7 @@ StockOracle 網頁介面（v2）：
 
 - 首次進入自動跑一次預設清單
 - 頂部「重新計算」、欄位篩選與彩色排名
-- 個股頁：K 線 + MA20/50/200 + 布林 + MACD + RSI + 短期訊號 + 基準對照 + log 切換
+- 個股頁：可選日／週／月 K（Yahoo 區間）；畫面上方調整抓取範圍與初始視窗；細節見摺疊。評分與策略仍以側欄「日線 period」為準。
 - 推薦解讀：多週期視角、停損／部位試算、失效條件、基本面
 - 顯示美股／台股各自最後一根 K 的時間，與失敗清單
 - 點表格列直接在「個股分析」開啟該檔
@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -39,9 +40,16 @@ from data_loader import (  # noqa: E402
     normalize_yahoo_symbol,
 )
 from holdings import (  # noqa: E402
+    POSITION_CASH,
+    POSITION_MARGIN,
     evaluate_holding,
     format_advice,
     format_outlook,
+    format_verdict_markdown,
+    owner_equity_market_value,
+    owner_entry_capital,
+    portfolio_verdict,
+    position_label,
 )
 from planner import (  # noqa: E402
     RISK_PROFILES,
@@ -72,25 +80,51 @@ from universe import (  # noqa: E402
 )
 
 
-# ----- 快取 -----
+# ----- 快取（個股等小範圍）-----
+
+
+_CHART_BAR_INTERVALS = ("1d", "1wk", "1mo")  # Yahoo interval；不含分鐘／小時 K
+_CHART_BAR_DEFAULT = "1d"
+
+
+def _chart_period_list(chart_iv: str, sidebar_period: str) -> tuple[list[str], str]:
+    """圖表 YF period 選項 defaults（依區間粒度）。"""
+    iv = (chart_iv or "1d").strip().lower()
+    sp = (sidebar_period or "1y").strip().lower()
+    if iv == "1wk":
+        out = ["1y", "2y", "5y", "10y", "max"]
+        dflt = "5y"
+    elif iv == "1mo":
+        out = ["5y", "10y", "max"]
+        dflt = "10y"
+    else:  # 1d 日線
+        out = ["5d", "1mo", "3mo", "6mo", "ytd", "1y", "2y", "5y", "10y", "max"]
+        dflt = sp if sp in out else "1y"
+    return out, dflt
+
+
+_CHART_XVIEW_ORDER = (
+    "all",
+    "last_4h", "last_8h", "last_24h",
+    "last_3d", "last_5d", "last_2w",
+    "last_1mo", "last_3mo", "last_6mo",
+    "ytd",
+    "last_1y", "last_2y", "last_5y", "last_10y",
+)
+
+
+def _chart_default_xview(_chart_iv: str) -> str:
+    return "all"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _cached_full_report(
-    symbols_tuple: tuple[str, ...],
-    period: str,
-    cache_buster: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str], dict]:
-    return run_full_report(symbols=list(symbols_tuple), period=period)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _cached_chart_bundle(symbol: str, period: str, cache_buster: int):
-    raw = fetch_history(symbol, period=period)
+def _cached_daily_bundle(symbol: str, period: str, cache_buster: int):
+    """日線資料：評分／策略／推薦解讀與主榜 period 對齊。"""
+    raw = fetch_history(symbol, period=period, interval="1d")
     if raw is None or raw.empty:
         return None
     bench_sym = benchmark_for_symbol(symbol)
-    bench_df = fetch_history(bench_sym, period=period)
+    bench_df = fetch_history(bench_sym, period=period, interval="1d")
     bench_close = bench_df["close"] if not bench_df.empty else None
     enriched = add_indicators(raw, bench_close=bench_close, include_full=True)
     snap = build_symbol_snapshot(symbol, raw, enriched=enriched, bench_close=bench_close)
@@ -98,6 +132,23 @@ def _cached_chart_bundle(symbol: str, period: str, cache_buster: int):
         return None
     fast = fetch_fast_info(symbol)
     return raw, enriched, snap, bench_close, bench_sym, fast
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_chart_visual(symbol: str, chart_period: str, interval: str, cache_buster: int):
+    """圖表專用：日／週／月 K（與區間對齊的基準對照線）。"""
+    raw = fetch_history(symbol, period=chart_period, interval=interval)
+    if raw is None or raw.empty:
+        return None
+    iv = interval.strip().lower()
+    bench_close = None
+    bench_sym = ""
+    if iv in ("1d", "1wk", "1mo"):
+        bench_sym = benchmark_for_symbol(symbol)
+        bench_df = fetch_history(bench_sym, period=chart_period, interval=iv)
+        bench_close = bench_df["close"] if not bench_df.empty else None
+    enriched_v = add_indicators(raw, bench_close=bench_close, include_full=True)
+    return raw, enriched_v, bench_close, bench_sym
 
 
 # ----- 表格輔助 -----
@@ -808,35 +859,87 @@ def _data_editor_stretch(
             return _render(use_container_width=True)
 
 
-def _coerce_holdings_dataframe(df: pd.DataFrame | None) -> pd.DataFrame:
-    """強制 holdings 為 streamlit NumberColumn/TextColumn 可接受的 dtypes。"""
+_HOLDINGS_COLS = [
+    "symbol", "position", "shares", "avg_cost", "margin_finance_pct", "margin_interest_pct", "note",
+]
+
+
+def _holdings_template_empty() -> pd.DataFrame:
+    fc = ("shares", "avg_cost", "margin_finance_pct", "margin_interest_pct")
+    return pd.DataFrame({c: pd.Series(dtype=("float64" if c in fc else "object"))
+                         for c in _HOLDINGS_COLS})
+
+
+def _holdings_schema_ok(df: pd.DataFrame | None) -> bool:
+    return df is not None and set(_HOLDINGS_COLS).issubset(df.columns)
+
+
+def _migrate_holdings_df(df: pd.DataFrame | None) -> pd.DataFrame:
+    """只補欄位／排序，不把整表 coercion（避免覆寫與 data_editor widget 打架）。"""
     if df is None or df.empty:
-        return pd.DataFrame(
-            {
-                "symbol": pd.Series(dtype="object"),
-                "shares": pd.Series(dtype="float64"),
-                "avg_cost": pd.Series(dtype="float64"),
-                "note": pd.Series(dtype="object"),
-            }
-        )
-
+        return _holdings_template_empty()
     out = df.copy()
-    for c in ("symbol", "shares", "avg_cost", "note"):
+    if "margin_loan" in out.columns:
+        if "margin_finance_pct" not in out.columns:
+            out["margin_finance_pct"] = np.nan
+        sh = pd.to_numeric(out.get("shares"), errors="coerce")
+        ac = pd.to_numeric(out.get("avg_cost"), errors="coerce")
+        cost = sh * ac
+        loan = pd.to_numeric(out["margin_loan"], errors="coerce")
+        mfp = pd.to_numeric(out.get("margin_finance_pct"), errors="coerce")
+        derived = np.where((cost > 0) & (loan > 0), (loan / cost) * 100.0, np.nan)
+        fill = np.where(pd.isna(mfp) & np.isfinite(derived), derived, mfp)
+        out["margin_finance_pct"] = fill
+        out = out.drop(columns=["margin_loan"], errors="ignore")
+    for c in _HOLDINGS_COLS:
         if c not in out.columns:
-            out[c] = np.nan if c in ("shares", "avg_cost") else ""
+            if c == "position":
+                out[c] = POSITION_CASH
+            elif c in ("symbol", "note"):
+                out[c] = ""
+            elif c in ("margin_finance_pct", "margin_interest_pct"):
+                out[c] = np.nan
+            else:
+                out[c] = np.nan
+    return out.reset_index(drop=True)[list(_HOLDINGS_COLS)]
 
-    out = out[["symbol", "shares", "avg_cost", "note"]]
 
-    sym = pd.Series(out["symbol"], dtype=object).where(pd.notna(out["symbol"]), "").astype(object)
-    out["symbol"] = sym.astype(str)
+def _normalize_position_cell(val: Any) -> str:
+    s = "" if val is None or (isinstance(val, float) and np.isnan(val)) else str(val).strip().lower()
+    if s in ("", "nan", POSITION_CASH, "cash", "現股"):
+        return POSITION_CASH
+    if s in (POSITION_MARGIN, "融資", "margin"):
+        return POSITION_MARGIN
+    return POSITION_CASH
 
-    nt = pd.Series(out["note"], dtype=object).where(pd.notna(out["note"]), "").astype(object)
-    out["note"] = nt.astype(str)
 
+def _hold_optional_positive_float(x: Any, *, gt_zero: bool) -> float | None:
+    if x is None:
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    if np.isnan(v):
+        return None
+    if gt_zero and v <= 0:
+        return None
+    return v
+
+
+def _finalize_holdings(df: pd.DataFrame | None) -> pd.DataFrame:
+    """CSV／新增列／編輯完成後統一 coercion，給編輯器與匯出的乾淨表。"""
+    out = _migrate_holdings_df(df)
+    if out.empty:
+        return out
+    out["symbol"] = pd.Series(out["symbol"], dtype=object).fillna("").astype(str)
+    out["position"] = out["position"].map(_normalize_position_cell)
+    out["note"] = pd.Series(out["note"], dtype=object).fillna("").astype(str)
     out["shares"] = pd.to_numeric(out["shares"], errors="coerce").astype(np.float64)
     out["avg_cost"] = pd.to_numeric(out["avg_cost"], errors="coerce").astype(np.float64)
-    out.reset_index(drop=True, inplace=True)
-    return out
+    out["margin_finance_pct"] = pd.to_numeric(out["margin_finance_pct"], errors="coerce").astype(np.float64)
+    out["margin_interest_pct"] = pd.to_numeric(out["margin_interest_pct"], errors="coerce").astype(np.float64)
+    return out.reset_index(drop=True)
 
 
 # ----- 持股健檢 tab -----
@@ -862,12 +965,11 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
     st.subheader(t("hold.section_title"))
     st.caption(t("hold.intro"))
 
-    # ---- 持股編輯（session state）----
-    # 每次進頁統一 coercion，確保 dtypes 給新版 Streamlit data_editor column_config（嚴檢相容）
+    # ---- 持股編輯（session state）：勿在每次 rerun 對 data_editor 前做整表 coercion，會與 widget 不同步 ---
     if "holdings_df" not in st.session_state:
-        st.session_state["holdings_df"] = _coerce_holdings_dataframe(pd.DataFrame())
-    else:
-        st.session_state["holdings_df"] = _coerce_holdings_dataframe(st.session_state["holdings_df"])
+        st.session_state["holdings_df"] = _holdings_template_empty()
+    elif not _holdings_schema_ok(st.session_state["holdings_df"]):
+        st.session_state["holdings_df"] = _migrate_holdings_df(st.session_state["holdings_df"])
     if "holdings_cash" not in st.session_state:
         st.session_state["holdings_cash"] = 0.0
 
@@ -894,8 +996,13 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
                     raise ValueError(f"missing columns: {need - set(df_in.columns)}")
                 if "note" not in df_in.columns:
                     df_in["note"] = ""
-                df_in = df_in[["symbol", "shares", "avg_cost", "note"]].fillna({"note": ""})
-                st.session_state["holdings_df"] = _coerce_holdings_dataframe(df_in.reset_index(drop=True))
+                opt = {"position": POSITION_CASH, "margin_finance_pct": np.nan, "margin_interest_pct": np.nan}
+                for oc, dv in opt.items():
+                    if oc not in df_in.columns:
+                        df_in[oc] = dv
+                df_in["position"] = df_in["position"].map(_normalize_position_cell)
+                df_in["note"] = df_in["note"].fillna("").astype(str)
+                st.session_state["holdings_df"] = _finalize_holdings(df_in.reset_index(drop=True))
                 st.success(t("hold.import_ok", n=len(df_in)))
                 # 清上一次健檢結果，避免 stale
                 if "holdings_result" in st.session_state:
@@ -913,51 +1020,82 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
             )
     with cIO3:
         if st.button(t("hold.clear_btn"), use_container_width=True):
-            st.session_state["holdings_df"] = _coerce_holdings_dataframe(pd.DataFrame())
+            st.session_state["holdings_df"] = _finalize_holdings(pd.DataFrame())
             st.session_state.pop("holdings_result", None)
             st.toast(t("hold.clear_confirm"), icon="🧹")
 
     add_col1, add_col2 = st.columns([1, 2])
     with add_col1:
         if st.button(t("hold.add_blank_row"), help=t("hold.add_blank_hint"), key="_hold_add_row"):
-            base = _coerce_holdings_dataframe(st.session_state["holdings_df"])
-            new_row = pd.DataFrame(
-                [{"symbol": "", "shares": np.nan, "avg_cost": np.nan, "note": ""}]
-            )
-            st.session_state["holdings_df"] = _coerce_holdings_dataframe(pd.concat([base, new_row], ignore_index=True))
+            base = _migrate_holdings_df(st.session_state["holdings_df"])
+            blank = {
+                "symbol": "", "position": POSITION_CASH, "shares": np.nan,
+                "avg_cost": np.nan, "margin_finance_pct": np.nan, "margin_interest_pct": np.nan, "note": "",
+            }
+            new_row = pd.DataFrame([blank])
+            st.session_state["holdings_df"] = _finalize_holdings(pd.concat([base, new_row], ignore_index=True))
             st.rerun()
     with add_col2:
         st.caption(t("hold.add_blank_hint"))
 
-    # 編輯器
-    edited = _data_editor_stretch(
-        st.session_state["holdings_df"],
-        num_rows="dynamic",
-        column_config={
-            "symbol": st.column_config.TextColumn(t("hold.col.symbol"), required=False),
-            "shares": st.column_config.NumberColumn(t("hold.col.shares"), min_value=0.0, step=1.0),
-            "avg_cost": st.column_config.NumberColumn(t("hold.col.avg_cost"), min_value=0.0, step=1e-4),
-            "note": st.column_config.TextColumn(t("hold.col.note")),
-        },
-        hide_index=True,
-        key="_hold_editor",
-    )
-    st.session_state["holdings_df"] = _coerce_holdings_dataframe(edited)
+    with st.form("hold_health_main", clear_on_submit=False):
+        edited = _data_editor_stretch(
+            st.session_state["holdings_df"],
+            num_rows="dynamic",
+            column_config={
+                "symbol": st.column_config.TextColumn(t("hold.col.symbol"), required=False),
+                "position": st.column_config.SelectboxColumn(
+                    t("hold.col.position"),
+                    options=[POSITION_CASH, POSITION_MARGIN],
+                    required=False,
+                ),
+                "shares": st.column_config.NumberColumn(t("hold.col.shares"), min_value=0.0, step=1.0),
+                "avg_cost": st.column_config.NumberColumn(t("hold.col.avg_cost"), min_value=0.0, step=1e-4),
+                "margin_finance_pct": st.column_config.NumberColumn(
+                    t("hold.col.margin_finance_pct"),
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=1.0,
+                    format="%.1f",
+                    help=t("hold.caption.margin_finance_pct_help"),
+                ),
+                "margin_interest_pct": st.column_config.NumberColumn(
+                    t("hold.col.margin_interest_pct"),
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=0.01,
+                    format="%.2f",
+                    help=t("hold.caption.margin_interest_pct_help"),
+                ),
+                "note": st.column_config.TextColumn(t("hold.col.note")),
+            },
+            hide_index=True,
+            key="_hold_editor_form",
+        )
+        cash_col, run_col = st.columns([1, 1])
+        with cash_col:
+            st.number_input(
+                t("hold.cash_label"),
+                value=float(st.session_state.get("holdings_cash", 0.0)),
+                min_value=0.0,
+                step=1000.0,
+                help=t("hold.cash_help"),
+                key="_hold_form_cash",
+            )
+        with run_col:
+            st.write("")
+            run_btn = st.form_submit_button(t("hold.run_btn"), type="primary", use_container_width=True)
+
+    st.session_state["holdings_df"] = _finalize_holdings(edited)
+    if "_hold_form_cash" in st.session_state:
+        st.session_state["holdings_cash"] = float(st.session_state["_hold_form_cash"])
     st.caption(t("hold.editor_caption"))
+    st.caption(t("hold.caption.position_codes"))
+    st.caption(t("hold.caption.margin_inputs_intro"))
 
-    cash_col, run_col = st.columns([1, 1])
-    with cash_col:
-        st.session_state["holdings_cash"] = float(st.number_input(
-            t("hold.cash_label"),
-            value=float(st.session_state.get("holdings_cash", 0.0)),
-            min_value=0.0, step=1000.0,
-            help=t("hold.cash_help"),
-        ))
-    with run_col:
-        st.write("")  # spacer
-        run_btn = st.button(t("hold.run_btn"), type="primary", use_container_width=True)
+    st.caption(t("hold.caption.margin_proxy"))
 
-    df_h = edited.copy()
+    df_h = st.session_state["holdings_df"].copy()
     for req in ("symbol", "shares", "avg_cost"):
         if req not in df_h.columns:
             st.error(("Missing column: " if get_lang() == "en" else "缺少欄位：") + req)
@@ -1005,6 +1143,16 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
             built_in = _ls_builtin()  # 用內建 5 套，不含 custom（持股展望統一比較）
             for sym, row, snap, enriched in raw_holdings:
                 market = "台股" if (sym.endswith(".TW") or sym.endswith(".TWO")) else "美股"
+                pos_r = str(row.get("position") or POSITION_CASH)
+
+                fin_pct = (
+                    _hold_optional_positive_float(row.get("margin_finance_pct"), gt_zero=True)
+                    if pos_r == POSITION_MARGIN else None
+                )
+                ir_pct = (
+                    _hold_optional_positive_float(row.get("margin_interest_pct"), gt_zero=True)
+                    if pos_r == POSITION_MARGIN else None
+                )
                 res = evaluate_holding(
                     symbol=sym,
                     shares=float(row["shares"]),
@@ -1014,6 +1162,9 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
                     portfolio_market_value=total_mv,
                     market_label=market,
                     note=str(row.get("note", "") or ""),
+                    position_type=pos_r,
+                    margin_finance_share_pct=fin_pct,
+                    margin_interest_rate_apy_pct=ir_pct,
                     strategies=built_in,
                 )
                 results.append(res)
@@ -1034,31 +1185,67 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
     results = bundle["results"]
     total_mv = bundle["total_mv"]
     cash = bundle["cash"]
-    total_capital = total_mv + cash
-    cost_total = sum(r.cost_basis for r in results)
+    equity_mv_holdings = sum(owner_equity_market_value(r) for r in results)
+    total_capital = cash + equity_mv_holdings
+    deploy_pct = (equity_mv_holdings / total_capital * 100.0) if total_capital > 0 else 0.0
+    cost_total = sum(owner_entry_capital(r) for r in results)
     pnl_total = sum(r.pnl for r in results)
     pnl_pct = (pnl_total / cost_total * 100.0) if cost_total > 0 else 0.0
     health_avg = (sum(r.health for r in results) / len(results)) if results else 0.0
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric(t("hold.metric.total_capital"), _planner_format_money(total_capital))
+    m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+    m1.metric(
+        t("hold.metric.total_capital"),
+        _planner_format_money(total_capital),
+        help=t("hold.metric.total_capital_help"),
+    )
     m2.metric(t("hold.metric.market_value"), _planner_format_money(total_mv))
-    m3.metric(t("hold.metric.cash"), _planner_format_money(cash))
-    m4.metric(t("hold.metric.unrealized"), _planner_format_money(pnl_total),
+    m3.metric(
+        t("hold.metric.cost_total"),
+        _planner_format_money(cost_total),
+        help=t("hold.metric.cost_total_help"),
+    )
+    m4.metric(t("hold.metric.cash"), _planner_format_money(cash))
+    m5.metric(t("hold.metric.unrealized"), _planner_format_money(pnl_total),
               delta=f"{pnl_pct:+.2f}%")
-    m5.metric(t("hold.metric.holdings_count"), str(len(results)))
-    m6.metric(t("hold.metric.health_avg"), f"{health_avg:.0f}")
+    m6.metric(t("hold.metric.holdings_count"), str(len(results)))
+    m7.metric(t("hold.metric.health_avg"), f"{health_avg:.0f}")
+    m8.metric(
+        t("hold.metric.deploy_pct"),
+        f"{deploy_pct:.2f}%",
+        help=t("hold.metric.deploy_pct_help"),
+    )
+
+    pv = portfolio_verdict(results, cash=cash)
+    if pv is not None:
+        st.markdown(format_verdict_markdown(pv))
 
     if not results:
         return
 
     rows = []
     for r in results:
+        ml_show = (
+            float(r.margin_loan) if (r.margin_loan is not None and r.position_type == POSITION_MARGIN)
+            else float("nan")
+        )
+        mq = r.margin_equity_pct if r.position_type == POSITION_MARGIN else float("nan")
+        mfs = r.margin_finance_share_pct if r.position_type == POSITION_MARGIN else float("nan")
+        mir = (
+            float(r.margin_interest_rate_apy_pct)
+            if (r.position_type == POSITION_MARGIN and r.margin_interest_rate_apy_pct is not None)
+            else float("nan")
+        )
         rows.append({
             t("hold.col.symbol"): format_symbol(r.symbol, dmode),
+            t("hold.col.position"): position_label(r.position_type),
             t("hold.col.market"): market_label(r.market),
             t("hold.col.shares"): r.shares,
             t("hold.col.avg_cost"): r.avg_cost,
+            t("hold.col.margin_finance_pct"): mfs,
+            t("hold.col.margin_interest_pct"): mir,
+            t("hold.col.estimated_margin_principal"): ml_show,
+            t("hold.col.margin_equity"): mq,
             t("hold.col.cur_price"): r.cur_price if r.cur_price is not None else float("nan"),
             t("hold.col.market_value"): r.market_value,
             t("hold.col.cost"): r.cost_basis,
@@ -1073,8 +1260,10 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
     df_show = pd.DataFrame(rows)
 
     pct_cols = [t("hold.col.pnl_pct"), t("hold.col.weight")]
+    margin_eq_col = t("hold.col.margin_equity")
     money_cols = [
         t("hold.col.cur_price"), t("hold.col.avg_cost"),
+        t("hold.col.estimated_margin_principal"),
         t("hold.col.market_value"), t("hold.col.cost"), t("hold.col.pnl"),
     ]
 
@@ -1097,7 +1286,18 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
     sty = df_show.style
     sty = sty.format({c: "{:,.2f}" for c in money_cols if c in df_show.columns}, na_rep="—")
     sty = sty.format({c: "{:+.2f}%" for c in pct_cols if c in df_show.columns}, na_rep="—")
-    sty = sty.format({t("hold.col.shares"): "{:,.0f}", t("hold.col.health"): "{:.0f}"})
+    if margin_eq_col in df_show.columns:
+        sty = sty.format({margin_eq_col: "{:.2f}%"}, na_rep="—")
+    fin_col = t("hold.col.margin_finance_pct")
+    mir_col = t("hold.col.margin_interest_pct")
+    if fin_col in df_show.columns:
+        sty = sty.format({fin_col: "{:.1f}%"}, na_rep="—")
+    if mir_col in df_show.columns:
+        sty = sty.format({mir_col: "{:.2f}%"}, na_rep="—")
+    sty = sty.format({
+        t("hold.col.shares"): "{:,.0f}",
+        t("hold.col.health"): "{:.0f}",
+    })
     pn_cols = [c for c in (t("hold.col.pnl"), t("hold.col.pnl_pct")) if c in df_show.columns]
     hh_cols = [c for c in (t("hold.col.health"),) if c in df_show.columns]
     if pn_cols:
@@ -1163,16 +1363,21 @@ def _is_likely_mobile() -> bool:
 
 
 def _plotly_config(mobile: bool = False) -> dict:
-    """共用的 Plotly config：手機上隱藏 modebar 多餘按鈕、開 responsive。"""
-    return {
+    """共用 Plotly config：桌面啟用捲輪縮放；手機仍可雙擊重置。"""
+    cfg: dict = {
         "responsive": True,
-        "displayModeBar": False if mobile else True,
+        "scrollZoom": True,
+        "doubleClick": "reset",
+        "displayModeBar": True if not mobile else "hover",
         "displaylogo": False,
         "modeBarButtonsToRemove": [
             "lasso2d", "select2d", "toggleSpikelines",
             "hoverClosestCartesian", "hoverCompareCartesian",
         ],
     }
+    if not mobile:
+        cfg["modeBarButtonsToAdd"] = ["zoomIn2d", "zoomOut2d", "resetScale2d"]
+    return cfg
 
 
 # ----- 主程式 -----
@@ -1217,12 +1422,23 @@ def main() -> None:
               flex-wrap: nowrap !important;
           }
           button[data-baseweb="tab"] { font-size: 0.85rem !important; padding: 0.4rem 0.6rem !important; }
-          /* Sidebar：先前 min-width 90% 會讓浮層幾乎蓋滿螢幕、主內容看不到 — 改為限寬上浮層 */
-          section[data-testid="stSidebar"] {
+          /* Sidebar：展開為限寬浮層；收合時不留寬條，主區盡量滿版 */
+          section[data-testid="stSidebar"][aria-expanded="true"],
+          div[data-testid="stSidebar"][aria-expanded="true"] {
               width: min(360px, 88vw) !important;
               min-width: 0 !important;
               max-width: 88vw !important;
               box-sizing: border-box !important;
+          }
+          section[data-testid="stSidebar"][aria-expanded="false"],
+          div[data-testid="stSidebar"][aria-expanded="false"] {
+              width: 0 !important;
+              min-width: 0 !important;
+              max-width: 0 !important;
+              padding: 0 !important;
+              margin: 0 !important;
+              border: none !important;
+              overflow: visible !important;
           }
         }
         </style>
@@ -1394,19 +1610,34 @@ def main() -> None:
         or st.session_state.get("_last_signature") != (tuple(symbols), period)
     )
     if needs_run:
-        spinner_msg = (
-            f"Fetching {len(symbols)} symbols and computing indicators… (first run / new universe takes longer)"
-            if get_lang() == "en" else
-            f"正在抓取 {len(symbols)} 檔資料並計算指標…（首次/換清單會稍久）"
-        )
-        with st.spinner(spinner_msg):
-            try:
-                all_df, short_df, failed, meta = _cached_full_report(
-                    tuple(symbols), period, st.session_state["cache_buster"]
+        prog = st.progress(0)
+        cap = st.empty()
+        n_tot = len(symbols)
+        spinner_msg = t("app.fetch_spin", n=n_tot)
+
+        def _progress_cb(cur: int, tot: int, sym: str, _ok: bool) -> None:
+            prog.progress(min(max(0.0, cur / float(max(1, tot))), 1.0))
+            short = sym if len(sym) <= 26 else sym[:22] + "…"
+            phase_key = (
+                "app.fetch_phase_dl" if n_tot <= 0 or cur <= n_tot else "app.fetch_phase_calc"
+            )
+            cap.caption(
+                t("app.fetch_status", cur=int(cur), total=int(tot), sym=short, phase=t(phase_key))
+            )
+
+        try:
+            with st.spinner(spinner_msg):
+                all_df, short_df, failed, meta = run_full_report(
+                    list(symbols), period=period, progress_cb=_progress_cb,
                 )
-            except Exception as e:
-                st.error(("Run failed: " if get_lang() == "en" else "執行失敗：") + str(e))
-                return
+        except Exception as e:
+            st.error(("Run failed: " if get_lang() == "en" else "執行失敗：") + str(e))
+            prog.empty()
+            cap.empty()
+            return
+        finally:
+            prog.empty()
+            cap.empty()
         st.session_state.update(
             {
                 "all_df": all_df,
@@ -1582,32 +1813,120 @@ def main() -> None:
             with cG:
                 show_signals = st.checkbox(t("one.show_signals"), value=True)
 
-            bundle = _cached_chart_bundle(pick, str(ui_meta.get("period", "1y")), st.session_state["cache_buster"])
-            if bundle is None:
+            sidebar_pd = str(ui_meta.get("period", "1y"))
+            ss = st.session_state
+            ss.setdefault("chart_iv_pick", {})
+            ss.setdefault("chart_cp_pick", {})
+            ss.setdefault("chart_xview_pick", {})
+
+            iv_was = ss["chart_iv_pick"].get(pick, _CHART_BAR_DEFAULT)
+            if iv_was not in _CHART_BAR_INTERVALS:
+                iv_was = _CHART_BAR_DEFAULT
+
+            c_iv, c_pd, c_xv = st.columns(3)
+            with c_iv:
+                chart_iv_eff = st.selectbox(
+                    t("chart.bar_interval_label"),
+                    options=list(_CHART_BAR_INTERVALS),
+                    index=list(_CHART_BAR_INTERVALS).index(iv_was),
+                    format_func=lambda k: t(f"chart.interval.{k}"),
+                    key=f"_bar_iv_{pick}",
+                )
+            ss["chart_iv_pick"][pick] = chart_iv_eff
+
+            ss.setdefault("_last_bar_iv_pick", {})
+            iv_changed = ss["_last_bar_iv_pick"].get(pick) != chart_iv_eff
+            ss["_last_bar_iv_pick"][pick] = chart_iv_eff
+
+            pl_opts, pd_def = _chart_period_list(chart_iv_eff, sidebar_pd)
+            cp_known = ss["chart_cp_pick"].get(pick, pd_def)
+            if iv_changed or cp_known not in pl_opts:
+                cp_known = pd_def
+            with c_pd:
+                chart_period = st.selectbox(
+                    t("chart.period_label"),
+                    options=pl_opts,
+                    index=pl_opts.index(cp_known),
+                    format_func=lambda p: t(f"chart.period.{p}"),
+                    key=f"_cp_{pick}",
+                )
+            ss["chart_cp_pick"][pick] = chart_period
+
+            xv_opts = list(_CHART_XVIEW_ORDER)
+            xv_def = _chart_default_xview(chart_iv_eff)
+            xv_known = ss["chart_xview_pick"].get(pick, xv_def)
+            if iv_changed or xv_known not in xv_opts:
+                xv_known = xv_def
+            with c_xv:
+                x_preset = st.selectbox(
+                    t("chart.xview_label"),
+                    options=xv_opts,
+                    index=xv_opts.index(xv_known),
+                    format_func=lambda xk: t("chart.xview.all") if xk == "all" else t(f"chart.xview.{xk}"),
+                    key=f"_xv_{pick}",
+                )
+            ss["chart_xview_pick"][pick] = x_preset
+
+            with st.expander(t("chart.expander.title"), expanded=False):
+                st.markdown(t("chart.expander.intro"))
+
+            chart_iv = chart_iv_eff
+
+            daily_b = _cached_daily_bundle(pick, sidebar_pd, st.session_state["cache_buster"])
+            if daily_b is None:
                 st.warning(t("one.no_history", sym=pick))
             else:
-                raw, enriched, snap, bench_close, bench_sym, fast = bundle
+                raw_d, enriched_d, snap, bench_close_d, bench_sym_d, fast = daily_b
                 title_label = format_symbol(pick, dmode)
+                strat_eval = active_strategy.evaluate(snap, enriched_d)
+                hist_daily = active_strategy.historical_signals(enriched_d)
 
-                strat_eval = active_strategy.evaluate(snap, enriched)
-                hist_sigs = active_strategy.historical_signals(enriched)
+                vis = _cached_chart_visual(pick, chart_period, chart_iv, st.session_state["cache_buster"])
+                if vis is None:
+                    st.warning(t("one.no_history", sym=format_symbol(pick, dmode)))
+                else:
+                    raw_v, enriched_v, bench_v, bench_n = vis
+                    bars_title = t(
+                        "chart.bars_combo",
+                        interval=t(f"chart.interval.{chart_iv}"),
+                        period=t(f"chart.period.{chart_period}"),
+                    )
 
-                fig = build_ohlcv_figure(
-                    enriched,
-                    title_label,
-                    ma_periods=ma_periods,
-                    show_bb=show_bb,
-                    show_signals=show_signals,
-                    show_macd=show_macd,
-                    show_rsi=show_rsi,
-                    log_scale=log_scale,
-                    bench_close=bench_close,
-                    bench_name=bench_sym,
-                    entry_dates=hist_sigs.get("entries", []),
-                    exit_dates=hist_sigs.get("exits", []),
-                    strategy_label=active_strategy.label,
-                )
-                st.plotly_chart(fig, use_container_width=True, config=_plotly_config(_is_likely_mobile()))
+                    intra = chart_iv.strip().lower() != "1d"
+                    if intra or not show_signals:
+                        ent_list: list = []
+                        exit_list: list = []
+                    else:
+                        ent_list = list(hist_daily.get("entries", []))
+                        exit_list = list(hist_daily.get("exits", []))
+                    sig_on = bool(show_signals) and not intra
+
+                    ss_chart = st.session_state
+                    ss_chart.setdefault("_one_chart_scope", "")
+                    chart_scope_key = f"{pick}|{chart_iv}|{chart_period}|{x_preset}"
+                    apply_initial_xrange = ss_chart["_one_chart_scope"] != chart_scope_key
+                    ss_chart["_one_chart_scope"] = chart_scope_key
+
+                    fig = build_ohlcv_figure(
+                        enriched_v,
+                        title_label,
+                        ma_periods=ma_periods,
+                        show_bb=show_bb,
+                        show_signals=sig_on,
+                        show_macd=show_macd,
+                        show_rsi=show_rsi,
+                        log_scale=log_scale,
+                        bench_close=bench_v,
+                        bench_name=bench_n,
+                        entry_dates=ent_list,
+                        exit_dates=exit_list,
+                        strategy_label=active_strategy.label,
+                        bars_title_line=bars_title,
+                        xrange_preset=x_preset,
+                        apply_x_visible_range=apply_initial_xrange,
+                        uirevision=chart_scope_key,
+                    )
+                    st.plotly_chart(fig, use_container_width=True, config=_plotly_config(_is_likely_mobile()))
 
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric(
@@ -1665,7 +1984,7 @@ def main() -> None:
                 st.markdown(
                     full_recommendation_markdown(
                         snap,
-                        daily_df=raw,
+                        daily_df=raw_d,
                         fast_info=fast,
                         strategy=active_strategy,
                     )

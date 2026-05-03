@@ -383,6 +383,72 @@ def test_holdings_health_and_advice():
         assert o["status_key"] in {"hold.outlook.bullish", "hold.outlook.warn", "hold.outlook.neutral"}
 
 
+def test_owner_entry_capital_margin_vs_cash():
+    """融資『成本』合計只計進場自備；現股為全額進場。"""
+    from holdings import POSITION_CASH, POSITION_MARGIN, HoldingResult, owner_entry_capital
+
+    rc = HoldingResult(
+        symbol="C", market="", shares=100, avg_cost=10, cur_price=10,
+        market_value=1000, cost_basis=1000, pnl=0, pnl_pct=0, weight_pct=0,
+        health=50, tier_zh="", advice_keys=[], outlook=[], note="",
+        position_type=POSITION_CASH, margin_loan=None, margin_equity_pct=None,
+        margin_finance_share_pct=None,
+        margin_interest_rate_apy_pct=None,
+    )
+    rm = HoldingResult(
+        symbol="M", market="", shares=100, avg_cost=10, cur_price=10,
+        market_value=1000, cost_basis=1000, pnl=0, pnl_pct=0, weight_pct=0,
+        health=50, tier_zh="", advice_keys=[], outlook=[], note="",
+        position_type=POSITION_MARGIN,
+        margin_loan=600.0,
+        margin_equity_pct=40.0,
+        margin_finance_share_pct=60.0,
+        margin_interest_rate_apy_pct=None,
+    )
+    assert owner_entry_capital(rc) == 1000.0
+    assert abs(owner_entry_capital(rm) - 400.0) < 1e-6
+
+
+def test_holdings_portfolio_verdict_and_margin_proxy():
+    from holdings import (
+        POSITION_CASH,
+        POSITION_MARGIN,
+        HoldingResult,
+        advice_keys,
+        margin_equity_ratio_pct,
+        portfolio_verdict,
+    )
+
+    v = margin_equity_ratio_pct(100_000.0, 70_000.0)
+    assert v is not None and abs(v - 30.0) < 1e-6
+    adv_m = advice_keys(
+        {"close": 100, "ma50": 90, "ma20": 95, "ma200": 80},
+        pnl_pct=5.0, weight_pct=10.0, hscore=50.0,
+        position_type=POSITION_MARGIN, margin_equity_pct=28.0,
+    )
+    assert "hold.advice.margin_equity_low" in adv_m
+
+    r_cash = HoldingResult(
+        symbol="B", market="美股", shares=10, avg_cost=10, cur_price=12,
+        market_value=120, cost_basis=100, pnl=20, pnl_pct=20, weight_pct=40,
+        health=70, tier_zh="中性", advice_keys=[], outlook=[], note="",
+        position_type=POSITION_CASH, margin_loan=None, margin_equity_pct=None,
+    )
+    r_mar = HoldingResult(
+        symbol="M", market="台股", shares=10, avg_cost=10, cur_price=12,
+        market_value=120, cost_basis=100, pnl=20, pnl_pct=20, weight_pct=60,
+        health=55, tier_zh="中性", advice_keys=[], outlook=[], note="",
+        position_type=POSITION_MARGIN, margin_loan=90.0,
+        margin_equity_pct=25.0,
+        margin_finance_share_pct=90.0,
+        margin_interest_rate_apy_pct=6.5,
+    )
+    pv = portfolio_verdict([r_cash, r_mar], cash=1000.0)
+    assert pv is not None and 0 <= pv.score <= 100
+    assert pv.tier_key.startswith("hold.verdict.tier.")
+    assert any(b[0] == "hold.verdict.bullet.has_margin" for b in pv.bullets)
+
+
 def test_holdings_handles_missing_snap():
     """抓不到資料 → 回 no_data 建議，不可崩。"""
     from holdings import evaluate_holding
@@ -412,6 +478,8 @@ if __name__ == "__main__":
         test_entry_exit_signals_paired_no_spam,
         test_custom_strategy_form_and_expression,
         test_holdings_health_and_advice,
+        test_owner_entry_capital_margin_vs_cash,
+        test_holdings_portfolio_verdict_and_margin_proxy,
         test_holdings_handles_missing_snap,
     ]
     failed = 0
