@@ -1,0 +1,56 @@
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ----- 虛擬環境 -----
+.venv/
+venv/
+env/
+ENV/
+
+# ----- 測試 / coverage -----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+
+# ----- IDE / 編輯器 -----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ----- 專案資料 / 快取（請勿上傳） -----
+.cache/
+data/universe_tw_*.json
+data/yf_v2/
+*.parquet
+*.csv
+
+# ----- 輸出 / 日誌 -----
+*.log
+logs/
+out/
+output/
+.streamlit/secrets.toml
+
+# ----- 環境變數 / 機密 -----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials.json
