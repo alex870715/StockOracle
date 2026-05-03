@@ -35,6 +35,11 @@ from data_loader import (  # noqa: E402
     fetch_history,
     normalize_yahoo_symbol,
 )
+from holdings import (  # noqa: E402
+    evaluate_holding,
+    format_advice,
+    format_outlook,
+)
 from planner import (  # noqa: E402
     RISK_PROFILES,
     TransactionCost,
@@ -49,9 +54,11 @@ from planner import (  # noqa: E402
 )
 from recommendation import full_recommendation_markdown  # noqa: E402
 from strategies import (  # noqa: E402
+    _CUSTOM_ALLOWED_COLS,
     DEFAULT_STRATEGY_KEY,
     get_strategy,
     list_strategies,
+    make_custom_strategy,
 )
 from symbol_meta import DISPLAY_MODES, format_symbol, reload_names  # noqa: E402
 from universe import (  # noqa: E402
@@ -578,7 +585,7 @@ def _render_planner_tab(all_df: pd.DataFrame, period: str, dmode: str, active_st
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
             yaxis_title=t("plan.bt.yaxis"),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, config=_plotly_config(_is_likely_mobile()))
 
         if not br.log.empty:
             with st.expander(t("plan.bt.event_log", n=len(br.log)), expanded=False):
@@ -594,6 +601,460 @@ def _render_planner_tab(all_df: pd.DataFrame, period: str, dmode: str, active_st
         st.warning(t("plan.bt.empty_warn"))
 
 
+# ----- 自訂策略 UI -----
+
+
+def _render_custom_strategy_form():
+    """sidebar 內的自訂策略 expander；建構 CustomStrategy 並回傳（無效 → None）。"""
+    op_keys = ["gt", "gte", "lt", "lte", "eq", "cross_above", "cross_below"]
+    op_label_keys = {
+        "gt": "custom.op.gt", "gte": "custom.op.gte",
+        "lt": "custom.op.lt", "lte": "custom.op.lte",
+        "eq": "custom.op.eq",
+        "cross_above": "custom.op.cross_above",
+        "cross_below": "custom.op.cross_below",
+    }
+
+    if "custom_cfg" not in st.session_state:
+        st.session_state["custom_cfg"] = {
+            "name": "",
+            "mode": "form",
+            "entry_conditions": [],
+            "exit_conditions": [],
+            "expression_entry": "",
+            "expression_exit": "",
+            "max_hold_days": 0,
+        }
+    cfg = st.session_state["custom_cfg"]
+
+    with st.expander(t("custom.section"), expanded=False):
+        st.caption(t("custom.section_caption"))
+        cfg["name"] = st.text_input(
+            t("custom.name"),
+            value=cfg.get("name", "") or t("custom.preview_label"),
+            key="_custom_name",
+        )
+
+        # 模式
+        mode = st.radio(
+            t("custom.mode"),
+            options=["form", "expression"],
+            index=0 if cfg.get("mode", "form") == "form" else 1,
+            format_func=lambda m: t("custom.mode_form") if m == "form" else t("custom.mode_expr"),
+            horizontal=True,
+            key="_custom_mode",
+        )
+        cfg["mode"] = mode
+
+        if mode == "form":
+            _render_cond_block(
+                cfg, "entry_conditions",
+                title=t("custom.entry_block"),
+                add_btn_label=t("custom.add_entry"),
+                op_keys=op_keys, op_label_keys=op_label_keys,
+            )
+            _render_cond_block(
+                cfg, "exit_conditions",
+                title=t("custom.exit_block"),
+                add_btn_label=t("custom.add_exit"),
+                op_keys=op_keys, op_label_keys=op_label_keys,
+            )
+        else:
+            cfg["expression_entry"] = st.text_area(
+                t("custom.expr_entry"),
+                value=cfg.get("expression_entry", ""),
+                height=68,
+                key="_custom_expr_entry",
+            )
+            cfg["expression_exit"] = st.text_area(
+                t("custom.expr_exit"),
+                value=cfg.get("expression_exit", ""),
+                height=68,
+                key="_custom_expr_exit",
+            )
+            st.caption(t("custom.expr_help"))
+
+        cfg["max_hold_days"] = int(st.number_input(
+            t("custom.max_hold"),
+            min_value=0, max_value=365,
+            value=int(cfg.get("max_hold_days", 0)),
+            step=1, key="_custom_max_hold",
+        ))
+
+    # 建構 strategy
+    try:
+        strat = make_custom_strategy(cfg)
+    except ValueError as e:
+        with st.sidebar:
+            st.error(t("custom.expr_invalid", err=str(e)))
+        return None
+    if strat is None:
+        return None
+    return strat
+
+
+def _render_cond_block(
+    cfg: dict, key: str, *,
+    title: str, add_btn_label: str,
+    op_keys: list[str], op_label_keys: dict,
+) -> None:
+    """條件列：每列一個 select(metric) + select(op) + radio(value/metric) + input。"""
+    st.markdown(f"**{title}**")
+    conds: list = cfg.get(key) or []
+    new_conds: list = []
+    metric_choices = list(_CUSTOM_ALLOWED_COLS)
+
+    to_remove = -1
+    for i, c in enumerate(conds):
+        c = dict(c)  # 防止直接寫 session
+        cols = st.columns([1.4, 1, 1.6, 0.4])
+        with cols[0]:
+            c["metric"] = st.selectbox(
+                t("custom.metric"), metric_choices,
+                index=metric_choices.index(c.get("metric", "close")) if c.get("metric") in metric_choices else 0,
+                key=f"_cust_{key}_metric_{i}",
+                label_visibility="collapsed",
+            )
+        with cols[1]:
+            c["op"] = st.selectbox(
+                t("custom.op"), op_keys,
+                index=op_keys.index(c.get("op", "gt")) if c.get("op") in op_keys else 0,
+                format_func=lambda k: t(op_label_keys[k]),
+                key=f"_cust_{key}_op_{i}",
+                label_visibility="collapsed",
+            )
+        with cols[2]:
+            kind = st.radio(
+                t("custom.against"),
+                options=["value", "metric"],
+                index=0 if c.get("against_kind", "value") == "value" else 1,
+                format_func=lambda k: t("custom.against_value") if k == "value" else t("custom.against_metric"),
+                horizontal=True,
+                key=f"_cust_{key}_kind_{i}",
+                label_visibility="collapsed",
+            )
+            c["against_kind"] = kind
+            if kind == "value":
+                c["against"] = float(st.number_input(
+                    t("custom.value"),
+                    value=float(c.get("against") or 0.0),
+                    step=1.0,
+                    key=f"_cust_{key}_val_{i}",
+                    label_visibility="collapsed",
+                ))
+            else:
+                default_m = c.get("against") if c.get("against") in metric_choices else "ma20"
+                c["against"] = st.selectbox(
+                    t("custom.value"), metric_choices,
+                    index=metric_choices.index(default_m),
+                    key=f"_cust_{key}_metric2_{i}",
+                    label_visibility="collapsed",
+                )
+        with cols[3]:
+            if st.button(t("custom.remove"), key=f"_cust_{key}_rm_{i}", use_container_width=True):
+                to_remove = i
+        new_conds.append(c)
+
+    if to_remove >= 0:
+        new_conds.pop(to_remove)
+
+    if st.button(add_btn_label, key=f"_cust_{key}_add", use_container_width=True):
+        new_conds.append({
+            "metric": "close", "op": "gt",
+            "against_kind": "metric", "against": "ma20",
+        })
+
+    cfg[key] = new_conds
+
+
+# ----- 持股健檢 tab -----
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_holding_data(symbol: str, period: str, cache_buster: int):
+    """單檔抓 history + indicators + snap，給持股健檢用。回 (snap, enriched) 或 None。"""
+    raw = fetch_history(symbol, period=period)
+    if raw is None or raw.empty:
+        return None
+    bench_sym = benchmark_for_symbol(symbol)
+    bench_df = fetch_history(bench_sym, period=period)
+    bench_close = bench_df["close"] if bench_df is not None and not bench_df.empty else None
+    enriched = add_indicators(raw, bench_close=bench_close, include_full=True)
+    snap = build_symbol_snapshot(symbol, raw, enriched=enriched, bench_close=bench_close)
+    if snap is None:
+        return None
+    return snap, enriched
+
+
+def _render_holdings_tab(period: str, dmode: str) -> None:
+    st.subheader(t("hold.section_title"))
+    st.caption(t("hold.intro"))
+
+    # ---- 持股編輯（session state）----
+    if "holdings_df" not in st.session_state:
+        st.session_state["holdings_df"] = pd.DataFrame(
+            {"symbol": [], "shares": [], "avg_cost": [], "note": []}
+        )
+    if "holdings_cash" not in st.session_state:
+        st.session_state["holdings_cash"] = 0.0
+
+    cIO1, cIO2, cIO3 = st.columns([1.3, 1.3, 1])
+    with cIO1:
+        up = st.file_uploader(
+            t("hold.import_csv"), type=["csv"],
+            help=t("hold.import_help"), key="_hold_csv_up",
+        )
+        if up is not None:
+            try:
+                df_in = pd.read_csv(up)
+                df_in.columns = [c.strip().lower() for c in df_in.columns]
+                need = {"symbol", "shares", "avg_cost"}
+                if not need.issubset(df_in.columns):
+                    raise ValueError(f"missing columns: {need - set(df_in.columns)}")
+                if "note" not in df_in.columns:
+                    df_in["note"] = ""
+                df_in = df_in[["symbol", "shares", "avg_cost", "note"]].fillna({"note": ""})
+                st.session_state["holdings_df"] = df_in.reset_index(drop=True)
+                st.success(t("hold.import_ok", n=len(df_in)))
+                st.session_state["_hold_csv_up"] = None  # 防止重複觸發
+            except Exception as e:
+                st.error(t("hold.import_fail", err=str(e)))
+    with cIO2:
+        df_now = st.session_state.get("holdings_df", pd.DataFrame())
+        if not df_now.empty:
+            csv_bytes = df_now.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                t("hold.export_csv"), data=csv_bytes,
+                file_name="stockoracle_holdings.csv",
+                use_container_width=True,
+            )
+    with cIO3:
+        if st.button(t("hold.clear_btn"), use_container_width=True):
+            st.session_state["holdings_df"] = pd.DataFrame(
+                {"symbol": [], "shares": [], "avg_cost": [], "note": []}
+            )
+            st.toast(t("hold.clear_confirm"), icon="🧹")
+
+    # 編輯器
+    edited = st.data_editor(
+        st.session_state["holdings_df"],
+        num_rows="dynamic",
+        width="stretch",
+        column_config={
+            "symbol": st.column_config.TextColumn(t("hold.col.symbol"), required=True),
+            "shares": st.column_config.NumberColumn(t("hold.col.shares"), min_value=0.0, step=1.0),
+            "avg_cost": st.column_config.NumberColumn(t("hold.col.avg_cost"), min_value=0.0, format="%.4f"),
+            "note": st.column_config.TextColumn(t("hold.col.note")),
+        },
+        hide_index=True,
+        key="_hold_editor",
+    )
+    st.session_state["holdings_df"] = edited
+    st.caption(t("hold.editor_caption"))
+
+    cash_col, run_col = st.columns([1, 1])
+    with cash_col:
+        st.session_state["holdings_cash"] = float(st.number_input(
+            t("hold.cash_label"),
+            value=float(st.session_state.get("holdings_cash", 0.0)),
+            min_value=0.0, step=1000.0,
+            help=t("hold.cash_help"),
+        ))
+    with run_col:
+        st.write("")  # spacer
+        run_btn = st.button(t("hold.run_btn"), type="primary", use_container_width=True)
+
+    df_h = edited.copy()
+    df_h = df_h[df_h["symbol"].astype(str).str.strip().ne("")]
+    df_h["symbol"] = df_h["symbol"].astype(str).str.strip().map(normalize_yahoo_symbol)
+    df_h = df_h[(df_h["shares"].fillna(0) > 0) & (df_h["avg_cost"].fillna(0) > 0)]
+
+    if df_h.empty:
+        st.info(t("hold.no_rows"))
+        return
+
+    if not run_btn and "holdings_result" not in st.session_state:
+        return
+
+    if run_btn:
+        with st.spinner(t("hold.fetching", n=len(df_h))):
+            results = []
+            failed: list[str] = []
+            cb = st.session_state.get("cache_buster", 0)
+            # 第一輪先抓資料 + 算市值
+            raw_holdings = []
+            for _, row in df_h.iterrows():
+                sym = str(row["symbol"]).strip()
+                bundle = _cached_holding_data(sym, period, cb)
+                if bundle is None:
+                    failed.append(sym)
+                    raw_holdings.append((sym, row, None, None))
+                    continue
+                snap, enriched = bundle
+                raw_holdings.append((sym, row, snap, enriched))
+            # 算總市值（給 weight%）
+            total_mv = 0.0
+            for sym, row, snap, _enr in raw_holdings:
+                if snap is None:
+                    continue
+                cur = snap.get("close")
+                if cur is not None:
+                    total_mv += float(row["shares"]) * float(cur)
+            # 第二輪：完整 evaluate（需要 portfolio_market_value）
+            from strategies import list_strategies as _ls_builtin
+            built_in = _ls_builtin()  # 用內建 5 套，不含 custom（持股展望統一比較）
+            for sym, row, snap, enriched in raw_holdings:
+                market = "台股" if (sym.endswith(".TW") or sym.endswith(".TWO")) else "美股"
+                res = evaluate_holding(
+                    symbol=sym,
+                    shares=float(row["shares"]),
+                    avg_cost=float(row["avg_cost"]),
+                    snap=snap,
+                    enriched=enriched,
+                    portfolio_market_value=total_mv,
+                    market_label=market,
+                    note=str(row.get("note", "") or ""),
+                    strategies=built_in,
+                )
+                results.append(res)
+
+            st.session_state["holdings_result"] = {
+                "results": results,
+                "failed": failed,
+                "total_mv": total_mv,
+                "cash": st.session_state["holdings_cash"],
+            }
+            for s in failed:
+                st.warning(t("hold.fetch_failed", sym=s))
+
+    bundle = st.session_state.get("holdings_result")
+    if not bundle:
+        return
+
+    results = bundle["results"]
+    total_mv = bundle["total_mv"]
+    cash = bundle["cash"]
+    total_capital = total_mv + cash
+    cost_total = sum(r.cost_basis for r in results)
+    pnl_total = sum(r.pnl for r in results)
+    pnl_pct = (pnl_total / cost_total * 100.0) if cost_total > 0 else 0.0
+    health_avg = (sum(r.health for r in results) / len(results)) if results else 0.0
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric(t("hold.metric.total_capital"), _planner_format_money(total_capital))
+    m2.metric(t("hold.metric.market_value"), _planner_format_money(total_mv))
+    m3.metric(t("hold.metric.cash"), _planner_format_money(cash))
+    m4.metric(t("hold.metric.unrealized"), _planner_format_money(pnl_total),
+              delta=f"{pnl_pct:+.2f}%")
+    m5.metric(t("hold.metric.holdings_count"), str(len(results)))
+    m6.metric(t("hold.metric.health_avg"), f"{health_avg:.0f}")
+
+    if not results:
+        return
+
+    rows = []
+    for r in results:
+        rows.append({
+            t("hold.col.symbol"): format_symbol(r.symbol, dmode),
+            t("hold.col.market"): market_label(r.market),
+            t("hold.col.shares"): r.shares,
+            t("hold.col.avg_cost"): r.avg_cost,
+            t("hold.col.cur_price"): r.cur_price if r.cur_price is not None else float("nan"),
+            t("hold.col.market_value"): r.market_value,
+            t("hold.col.cost"): r.cost_basis,
+            t("hold.col.pnl"): r.pnl,
+            t("hold.col.pnl_pct"): r.pnl_pct,
+            t("hold.col.weight"): r.weight_pct,
+            t("hold.col.health"): r.health,
+            t("hold.col.tier"): tier_label(r.tier_zh),
+            t("hold.col.advice"): format_advice(r.advice_keys),
+            t("hold.col.outlook"): format_outlook(r.outlook, limit=2),
+        })
+    df_show = pd.DataFrame(rows)
+
+    pct_cols = [t("hold.col.pnl_pct"), t("hold.col.weight")]
+    money_cols = [
+        t("hold.col.cur_price"), t("hold.col.avg_cost"),
+        t("hold.col.market_value"), t("hold.col.cost"), t("hold.col.pnl"),
+    ]
+
+    def _color_pnl(v):
+        if v is None or pd.isna(v):
+            return ""
+        return "color: #66bb6a" if v > 0 else ("color: #ef5350" if v < 0 else "")
+
+    def _color_health(v):
+        if v is None or pd.isna(v):
+            return ""
+        if v >= 70:
+            return "background-color: #1b5e20; color: white"
+        if v >= 50:
+            return "background-color: #689f38; color: white"
+        if v >= 30:
+            return "background-color: #f9a825; color: black"
+        return "background-color: #c62828; color: white"
+
+    sty = df_show.style
+    sty = sty.format({c: "{:,.2f}" for c in money_cols if c in df_show.columns}, na_rep="—")
+    sty = sty.format({c: "{:+.2f}%" for c in pct_cols if c in df_show.columns}, na_rep="—")
+    sty = sty.format({t("hold.col.shares"): "{:,.0f}", t("hold.col.health"): "{:.0f}"})
+    sty = sty.applymap(_color_pnl, subset=[t("hold.col.pnl"), t("hold.col.pnl_pct")])
+    sty = sty.applymap(_color_health, subset=[t("hold.col.health")])
+
+    st.dataframe(sty, width="stretch", hide_index=True)
+
+    # ---- 個別持股展望 ----
+    with st.expander(t("hold.detail_title"), expanded=False):
+        st.caption(t("hold.outlook_caption"))
+        for r in results:
+            if not r.outlook:
+                continue
+            st.markdown(f"**{format_symbol(r.symbol, dmode)}** &nbsp; — &nbsp; "
+                        f"{t('hold.col.health')}: **{r.health:.0f}** &nbsp; · &nbsp; "
+                        f"{t('hold.col.advice')}：{format_advice(r.advice_keys)}")
+            ocols = st.columns(len(r.outlook))
+            for ic, o in enumerate(r.outlook):
+                tone = {"hold.outlook.bullish": "✅", "hold.outlook.warn": "⚠️",
+                        "hold.outlook.neutral": "·"}.get(o["status_key"], "·")
+                ocols[ic].markdown(
+                    f"<small>{tone} {o['strategy_label']}<br/>"
+                    f"<b>{t(o['status_key'])}</b> &nbsp; ({o['score']:.1f}/10)</small>",
+                    unsafe_allow_html=True,
+                )
+            st.divider()
+
+
+# ----- 手機偵測（Streamlit ≥ 1.30 才有 st.context.headers） -----
+
+
+def _is_likely_mobile() -> bool:
+    """簡易手機偵測；新版 Streamlit 才有 st.context.headers。失敗就回 False。"""
+    try:
+        ctx = getattr(st, "context", None)
+        if ctx is None:
+            return False
+        headers = getattr(ctx, "headers", None)
+        if not headers:
+            return False
+        ua = (headers.get("user-agent") or headers.get("User-Agent") or "").lower()
+        return any(k in ua for k in ("iphone", "android", "ipad", "mobile"))
+    except Exception:
+        return False
+
+
+def _plotly_config(mobile: bool = False) -> dict:
+    """共用的 Plotly config：手機上隱藏 modebar 多餘按鈕、開 responsive。"""
+    return {
+        "responsive": True,
+        "displayModeBar": False if mobile else True,
+        "displaylogo": False,
+        "modeBarButtonsToRemove": [
+            "lasso2d", "select2d", "toggleSpikelines",
+            "hoverClosestCartesian", "hoverCompareCartesian",
+        ],
+    }
+
+
 # ----- 主程式 -----
 
 
@@ -602,13 +1063,43 @@ def main() -> None:
     if "lang" not in st.session_state:
         st.session_state["lang"] = "zh"
 
-    st.set_page_config(page_title=t("app.page_title"), layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(
+        page_title=t("app.page_title"),
+        layout="wide",
+        # 手機進來預設收起 sidebar，騰出寬度
+        initial_sidebar_state="collapsed" if _is_likely_mobile() else "expanded",
+    )
 
     st.markdown(
         """
         <style>
         .small-meta { color: #9e9e9e; font-size: 0.85rem; margin-top: -10px; }
         div[data-testid="stMetricValue"] { font-size: 1.05rem; }
+
+        /* 手機（<= 768 px）：縮字、metric 寬鬆換行、表格水平 scroll、tab 字級小 */
+        @media (max-width: 768px) {
+          html, body, [class*="css"] { font-size: 14px !important; }
+          h1 { font-size: 1.4rem !important; }
+          h2 { font-size: 1.15rem !important; }
+          h3 { font-size: 1.0rem !important; }
+          .small-meta { font-size: 0.75rem !important; }
+          /* metric value 縮一點，避免長數字爆版 */
+          div[data-testid="stMetricValue"] { font-size: 0.95rem !important; }
+          div[data-testid="stMetricLabel"] { font-size: 0.7rem !important; }
+          /* 多欄縮間距 */
+          div[data-testid="stHorizontalBlock"] { gap: 0.5rem !important; }
+          /* DataFrame 內滑動 */
+          div[data-testid="stDataFrame"] { overflow-x: auto !important; }
+          /* tab 列水平捲、字小 */
+          div[data-baseweb="tab-list"] {
+              overflow-x: auto !important;
+              white-space: nowrap !important;
+              flex-wrap: nowrap !important;
+          }
+          button[data-baseweb="tab"] { font-size: 0.85rem !important; padding: 0.4rem 0.6rem !important; }
+          /* sidebar 開啟時佔滿 90% 寬避免擠壓 */
+          section[data-testid="stSidebar"] { min-width: 90% !important; }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -627,21 +1118,6 @@ def main() -> None:
         st.session_state["cache_buster"] = 0
 
     with st.sidebar:
-        # ---- 語言切換 ----
-        lang_labels = {"zh": "繁體中文", "en": "English"}
-        cur_lang = get_lang()
-        new_lang = st.radio(
-            t("sidebar.language"),
-            options=list(LANGS),
-            index=list(LANGS).index(cur_lang),
-            format_func=lambda k: lang_labels[k],
-            horizontal=True,
-            key="_lang_picker",
-        )
-        if new_lang != cur_lang:
-            set_lang(new_lang)
-            st.rerun()
-
         st.subheader(t("sidebar.market_section"))
         market_options_zh = ["全部", "美股", "台股"]
         market = st.radio(
@@ -707,7 +1183,12 @@ def main() -> None:
         )
 
         st.subheader(t("sidebar.strategy_section"))
-        strategies = list_strategies()
+
+        # ---- 自訂策略（折疊在策略選單上方）----
+        custom_strat = _render_custom_strategy_form()
+
+        extra_strats = [custom_strat] if custom_strat is not None else []
+        strategies = list_strategies(extra=extra_strats)
         strat_keys = [s.key for s in strategies]
         strat_default = strat_keys.index(DEFAULT_STRATEGY_KEY) if DEFAULT_STRATEGY_KEY in strat_keys else 0
         strat_key = st.selectbox(
@@ -724,7 +1205,7 @@ def main() -> None:
             ),
             help=t("sidebar.strategy_help"),
         )
-        active_strategy = get_strategy(strat_key)
+        active_strategy = get_strategy(strat_key, extra=extra_strats)
         with st.expander(t("sidebar.strategy_expander"), expanded=False):
             st.markdown(f"**{active_strategy.label}**\n\n{active_strategy.description}")
             st.markdown(f"**{t('common.entry_rules')}**")
@@ -734,20 +1215,39 @@ def main() -> None:
             for r in active_strategy.exit_rules_text:
                 st.markdown(f"- {r}")
 
-        st.subheader(t("sidebar.display_section"))
-        display_label_map_zh = {"名稱 代號": t("display.name_symbol"),
-                                "代號": t("display.symbol_only"),
-                                "名稱": t("display.name_only")}
-        display_mode = st.radio(
-            t("sidebar.symbol_display_mode"),
-            DISPLAY_MODES,
-            index=0,
-            horizontal=False,
-            format_func=lambda x: display_label_map_zh.get(x, x),
-            help=t("sidebar.symbol_display_help"),
-        )
+        # ---- 設定 expander（含語言、顯示模式、進階）----
+        with st.expander(t("settings.section"), expanded=False):
+            st.caption(t("settings.section_help"))
 
-        with st.expander(t("common.advanced"), expanded=False):
+            # 語言
+            lang_labels = {"zh": "繁體中文", "en": "English"}
+            cur_lang = get_lang()
+            new_lang = st.radio(
+                t("sidebar.language"),
+                options=list(LANGS),
+                index=list(LANGS).index(cur_lang),
+                format_func=lambda k: lang_labels[k],
+                horizontal=True,
+                key="_lang_picker_settings",
+            )
+            if new_lang != cur_lang:
+                set_lang(new_lang)
+                st.rerun()
+
+            # 顯示模式
+            display_label_map_zh = {"名稱 代號": t("display.name_symbol"),
+                                    "代號": t("display.symbol_only"),
+                                    "名稱": t("display.name_only")}
+            display_mode = st.radio(
+                t("sidebar.symbol_display_mode"),
+                DISPLAY_MODES,
+                index=0,
+                horizontal=False,
+                format_func=lambda x: display_label_map_zh.get(x, x),
+                help=t("sidebar.symbol_display_help"),
+            )
+
+            # 進階
             short_top = st.number_input(t("sidebar.short_top"), 0, 50, 15, help=t("sidebar.short_top_help"))
             force_refresh = st.checkbox(t("sidebar.force_refresh"), value=False)
             if force_refresh:
@@ -823,8 +1323,8 @@ def main() -> None:
         with st.expander(t("top.failed_list", n=len(failed)), expanded=False):
             st.write(", ".join(failed))
 
-    tab_rank, tab_one, tab_short, tab_plan = st.tabs(
-        [t("tabs.rank"), t("tabs.one"), t("tabs.short"), t("tabs.plan")]
+    tab_rank, tab_one, tab_short, tab_plan, tab_holdings = st.tabs(
+        [t("tabs.rank"), t("tabs.one"), t("tabs.short"), t("tabs.plan"), t("tabs.holdings")]
     )
 
     # ---- 排名與篩選 ----
@@ -892,6 +1392,10 @@ def main() -> None:
     # ---- 資產規劃 ----
     with tab_plan:
         _render_planner_tab(all_df, period, dmode, active_strategy)
+
+    # ---- 持股健檢 ----
+    with tab_holdings:
+        _render_holdings_tab(period=str(ui_meta.get("period", "1y")), dmode=dmode)
 
     # ---- 個股分析 ----
     with tab_one:
@@ -978,7 +1482,7 @@ def main() -> None:
                     exit_dates=hist_sigs.get("exits", []),
                     strategy_label=active_strategy.label,
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, config=_plotly_config(_is_likely_mobile()))
 
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric(

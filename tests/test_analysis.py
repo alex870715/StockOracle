@@ -282,6 +282,120 @@ def test_entry_exit_signals_paired_no_spam():
     assert paired_x[1] == idx[9]
 
 
+def test_custom_strategy_form_and_expression():
+    """自訂策略：form 模式 + 表達式模式都要能 evaluate 並回正常欄位。"""
+    from strategies import (
+        make_custom_strategy, _validate_custom_expression,
+        _rewrite_expr_for_pandas,
+    )
+
+    df = _make_random_ohlcv(n=300, seed=21)
+    enriched = add_indicators(df, include_full=True)
+    snap = build_symbol_snapshot("FAKE", df, enriched=enriched)
+
+    # ---- form mode：close > ma20 AND rsi14 < 70 ----
+    cfg_form = {
+        "name": "TestForm", "mode": "form",
+        "entry_conditions": [
+            {"metric": "close", "op": "gt", "against_kind": "metric", "against": "ma20"},
+            {"metric": "rsi14", "op": "lt", "against_kind": "value", "against": 70},
+        ],
+        "exit_conditions": [
+            {"metric": "rsi14", "op": "gt", "against_kind": "value", "against": 80},
+        ],
+        "max_hold_days": 30,
+    }
+    s_form = make_custom_strategy(cfg_form)
+    assert s_form is not None
+    ev = s_form.evaluate(snap, enriched)
+    for k in ("entry_today", "exit_today", "score", "recommendation",
+              "rule_hits", "rule_misses", "entry_rules_text", "exit_rules_text"):
+        assert k in ev, f"missing {k}"
+    assert isinstance(ev["entry_today"], bool)
+    assert 0.0 <= ev["score"] <= 10.0 + 1e-9
+    sig = s_form.historical_signals(enriched)
+    assert "entries" in sig and "exits" in sig
+
+    # ---- expression mode + AST 重寫 ----
+    expr = "close > ma20 and rsi14 < 70"
+    ok, err = _validate_custom_expression(expr)
+    assert ok, f"expr should validate: {err}"
+    rewritten = _rewrite_expr_for_pandas(expr)
+    assert "&" in rewritten and "and" not in rewritten
+
+    # 危險表達式必須拒絕
+    bad = '__import__("os").system("rm")'
+    ok2, _ = _validate_custom_expression(bad)
+    assert not ok2
+
+    cfg_expr = {
+        "name": "TestExpr", "mode": "expression",
+        "expression_entry": "close > ma20 and rsi14 < 70",
+        "expression_exit":  "rsi14 > 80 or close < ma20",
+        "max_hold_days": 0,
+    }
+    s_expr = make_custom_strategy(cfg_expr)
+    assert s_expr is not None
+    ev2 = s_expr.evaluate(snap, enriched)
+    assert isinstance(ev2["entry_today"], bool)
+
+
+def test_holdings_health_and_advice():
+    """持股健檢：health 0–100、advice 不為空、tier 落在合法集合。"""
+    from holdings import evaluate_holding, health_score, advice_keys
+    from strategies import list_strategies as _ls
+
+    df = _make_random_ohlcv(n=400, seed=42)
+    enr = add_indicators(df, include_full=True)
+    snap = build_symbol_snapshot("AAPL", df, enriched=enr)
+    snap["market"] = "美股"
+
+    h = health_score(snap, weight_pct=15.0)
+    assert 0 <= h <= 100
+    advs = advice_keys(snap, pnl_pct=12.0, weight_pct=15.0, hscore=h)
+    assert advs and all(k.startswith("hold.advice.") for k in advs)
+
+    # 高度集中 → reduce_overweight 應被觸發
+    advs2 = advice_keys(snap, pnl_pct=5.0, weight_pct=45.0, hscore=h)
+    assert "hold.advice.reduce_overweight" in advs2
+
+    # 大幅獲利 → strong_take_profit
+    advs3 = advice_keys(snap, pnl_pct=70.0, weight_pct=10.0, hscore=h)
+    assert "hold.advice.strong_take_profit" in advs3
+
+    # 大幅虧損 → cut_loss
+    advs4 = advice_keys(snap, pnl_pct=-20.0, weight_pct=10.0, hscore=h)
+    assert "hold.advice.cut_loss" in advs4
+
+    res = evaluate_holding(
+        symbol="AAPL", shares=100, avg_cost=80,
+        snap=snap, enriched=enr,
+        portfolio_market_value=15000.0,
+        market_label="美股",
+        strategies=_ls(),
+    )
+    assert res.cur_price is not None and res.cur_price > 0
+    assert res.market_value > 0
+    assert res.cost_basis == 100 * 80
+    assert res.tier_zh in {"強烈買進", "買進", "偏多觀察", "中性", "避開", "—"}
+    assert len(res.outlook) == 5  # 內建 5 套策略各 1 筆
+    for o in res.outlook:
+        assert o["status_key"] in {"hold.outlook.bullish", "hold.outlook.warn", "hold.outlook.neutral"}
+
+
+def test_holdings_handles_missing_snap():
+    """抓不到資料 → 回 no_data 建議，不可崩。"""
+    from holdings import evaluate_holding
+    res = evaluate_holding(
+        symbol="BAD.SYM", shares=10, avg_cost=100,
+        snap=None, enriched=None,
+        portfolio_market_value=0.0, market_label="美股",
+    )
+    assert res.cur_price is None
+    assert res.advice_keys == ["hold.advice.no_data"]
+    assert res.tier_zh == "—"
+
+
 if __name__ == "__main__":
     fns = [
         test_rsi_basic_range,
@@ -296,6 +410,9 @@ if __name__ == "__main__":
         test_walk_forward_no_lookahead,
         test_i18n_switch_propagates,
         test_entry_exit_signals_paired_no_spam,
+        test_custom_strategy_form_and_expression,
+        test_holdings_health_and_advice,
+        test_holdings_handles_missing_snap,
     ]
     failed = 0
     for fn in fns:

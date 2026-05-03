@@ -10,7 +10,7 @@
 
 ## 主要特色
 
-### 多策略 Engine（5 套，模組化擴充）
+### 多策略 Engine（5 套內建 + 自訂策略）
 
 | 策略 | 適用週期 | 風險 | 進場條件 |
 |---|---|---|---|
@@ -21,6 +21,19 @@
 | 防守型 ETF | 中長期 | 低 | 60D 年化波動 < 25% + MDD > ‑10% + Close > MA200 |
 
 每個策略都會給出：策略命中度（0–10）、進出場規則文字、即時觸發狀態、歷史進出場標記（圖上黃／紅三角）。
+
+**自訂策略**：sidebar 點開「✏️ 自訂策略」expander 可組你自己的：
+- 表單模式：下拉選 metric / 比較運算子 / 比較值（或另一個指標），entry/exit 各加 N 條
+- 表達式模式（進階）：直接寫 `close > ma20 and rsi14 < 70 and volume_ratio > 1.5`，AST 安全驗證 + 自動轉成 pandas-friendly 運算
+
+### 持股健檢
+
+新增「🏥 持股健檢」tab：
+- 表格直接編輯持股（symbol / shares / avg_cost / note），可匯入／匯出 CSV
+- 即時抓 yfinance 算市值 / 損益 / 損益%
+- **體檢分數 0–100**：趨勢、動能、距 52 週高、回撤、ATR、波動率、流動性、權重集中度多因子加權
+- **建議**：強烈停利 / 停利轉弱 / 續抱 / 加碼回測支撐 / 停損 / 減碼集中度
+- **多策略展望**：對每檔持股跑內建 5 套策略 → 仍看好 / 警示 / 中性
 
 ### 資產規劃 + 真 Walk-Forward 回測
 
@@ -44,7 +57,11 @@
 
 ### 中英雙語
 
-Sidebar 一鍵切換 zh / en，全部 UI、策略名稱、條件描述、回測 metric、推薦解讀都跟著變，但資料層的 key 維持中文以保持邏輯穩定。
+「⚙️ 設定」expander 一鍵切換 zh / en，全部 UI、策略名稱、條件描述、回測 metric、推薦解讀、健檢建議都跟著變，但資料層的 key 維持中文以保持邏輯穩定。
+
+### 手機友善
+
+CSS @media query 自動縮字、metric 卡密度調整、表格水平 scroll、tab 列水平捲、Plotly 圖 responsive；偵測到手機 user-agent 預設摺起 sidebar。複雜分析（資產規劃 / 完整回測）仍建議桌面操作。
 
 ### 台股全市場支援
 
@@ -88,19 +105,20 @@ streamlit run app.py
 ## 模組架構
 
 ```
-app.py                    # Streamlit UI（4 個 tab：排名 / 個股 / 短期 / 規劃）
+app.py                    # Streamlit UI（5 個 tab：排名 / 個股 / 短期 / 規劃 / 健檢）
 i18n.py                   # 雙語字典 + t() / set_lang()
 data_loader.py            # Yahoo Finance 抓取 + retry + disk cache
 analysis.py               # 技術指標：MA / RSI / ATR / Bollinger / MACD / 相對強弱
-strategies.py             # 5 套策略：evaluate / historical_signals
+strategies.py             # 5 套內建策略 + CustomStrategy（form / expression）
 daily_pick.py             # 多因子綜合分數 + 排名 + 短期戰術訊號
 planner.py                # Goal-based 配置 + 三層再平衡 + walk-forward 回測
+holdings.py               # 持股健檢：health score / advice / strategy outlook
 recommendation.py         # 推薦解讀 markdown 生成
 charts.py                 # OHLCV 多子圖 + 指標 + 進出場標記 + 基準對照
 universe.py               # 預設股票池
 symbol_meta.py            # 代號↔名稱映射
-tools/sync_tw_universe.py # TWSE / TPEx 名單抓取
-tests/test_analysis.py    # 12 個 sanity test
+tools/sync_tw_universe.py # TWSE / TPEx 名單抓取（含 SSL fallback）
+tests/test_analysis.py    # 15 個 sanity test
 ```
 
 ---

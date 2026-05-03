@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -802,6 +803,399 @@ class DefensiveETF(_Base):
         return _clean_signals(entry, exit_, max_hold_days=None)
 
 
+# ---- 6) 自訂策略（form-based + 進階表達式） ----
+
+
+# 給使用者用的指標白名單。任何沒列在這裡的欄位都不能在表達式 / 條件用，避免他亂打。
+_CUSTOM_ALLOWED_COLS: tuple[str, ...] = (
+    "close", "open", "high", "low", "volume",
+    "ma5", "ma10", "ma20", "ma30", "ma50", "ma60", "ma120", "ma200",
+    "rsi14", "atr14", "atr14_pct",
+    "vol_60d_ann", "mdd_60d", "dist_to_52w_high_pct",
+    "volume_ratio", "macd_hist", "ret_1d", "day_close_loc",
+)
+
+
+_CUSTOM_OP_LABEL = {
+    "gt": ">", "gte": "≥", "lt": "<", "lte": "≤", "eq": "=",
+    "cross_above": "↗", "cross_below": "↘",
+}
+
+
+@dataclass
+class CustomCondition:
+    """form-based 條件描述：{metric} {op} {value or other_metric}"""
+    metric: str            # 必須在 _CUSTOM_ALLOWED_COLS
+    op: str                # gt / gte / lt / lte / eq / cross_above / cross_below
+    against_kind: str      # "value" 或 "metric"
+    against: Any           # float（value）或 str（metric column name）
+
+    def is_valid(self) -> bool:
+        if self.metric not in _CUSTOM_ALLOWED_COLS:
+            return False
+        if self.op not in _CUSTOM_OP_LABEL:
+            return False
+        if self.against_kind == "value":
+            try:
+                float(self.against)
+                return True
+            except (TypeError, ValueError):
+                return False
+        if self.against_kind == "metric":
+            return self.against in _CUSTOM_ALLOWED_COLS
+        return False
+
+    def describe(self) -> str:
+        opl = _CUSTOM_OP_LABEL.get(self.op, self.op)
+        rhs = (
+            f"{float(self.against):g}"
+            if self.against_kind == "value"
+            else str(self.against)
+        )
+        return f"{self.metric} {opl} {rhs}"
+
+    # ---- 取兩個 Series：左 & 右 ----
+    def _series_pair(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+        left = _series(df, self.metric)
+        if self.against_kind == "value":
+            right = pd.Series(float(self.against), index=df.index)
+        else:
+            right = _series(df, str(self.against))
+        return left, right
+
+    def to_mask(self, df: pd.DataFrame) -> pd.Series:
+        left, right = self._series_pair(df)
+        if self.op == "gt":
+            return left > right
+        if self.op == "gte":
+            return left >= right
+        if self.op == "lt":
+            return left < right
+        if self.op == "lte":
+            return left <= right
+        if self.op == "eq":
+            return left == right
+        if self.op == "cross_above":
+            # 昨天 left <= right，今天 left > right
+            prev_left = left.shift(1)
+            prev_right = right.shift(1)
+            return (prev_left <= prev_right) & (left > right)
+        if self.op == "cross_below":
+            prev_left = left.shift(1)
+            prev_right = right.shift(1)
+            return (prev_left >= prev_right) & (left < right)
+        return pd.Series(False, index=df.index)
+
+
+# ---- 安全表達式 eval（進階模式）----
+
+
+_EXPR_ALLOWED_NAMES = set(_CUSTOM_ALLOWED_COLS)
+
+
+def _validate_custom_expression(expr: str) -> tuple[bool, str]:
+    """
+    嚴格 AST 驗證：只允許列在白名單的欄位、比較、布林、算術、括號與數值。
+    禁止：函數呼叫、屬性存取、index、lambda、import、字串等。
+    """
+    if not expr or not expr.strip():
+        return False, "empty"
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as e:
+        return False, f"syntax: {e.msg}"
+
+    allowed_node_types = (
+        ast.Expression, ast.BoolOp, ast.UnaryOp, ast.Compare,
+        ast.Name, ast.Constant, ast.Load,
+        ast.BinOp, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow,
+        ast.And, ast.Or, ast.Not, ast.USub, ast.UAdd,
+        ast.Gt, ast.GtE, ast.Lt, ast.LtE, ast.Eq, ast.NotEq,
+        ast.Tuple,  # 允許 a < b < c 之類
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, allowed_node_types):
+            return False, f"disallowed node: {type(node).__name__}"
+        if isinstance(node, ast.Name) and node.id not in _EXPR_ALLOWED_NAMES:
+            return False, f"unknown name: {node.id}"
+        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float, bool)):
+            return False, f"disallowed constant: {type(node.value).__name__}"
+    return True, ""
+
+
+class _BoolOpToBitOp(ast.NodeTransformer):
+    """把 Python 的 and/or/not（不支援 pandas Series）改寫成 & | ~。
+
+    需要包成 ast.BinOp(BitAnd) / ast.BinOp(BitOr) / ast.UnaryOp(Invert)，
+    且 BitAnd/BitOr 的 precedence 比比較運算子高，所以個別 operand 要強制括號化
+    （在 unparse 階段 ast 會自動為 Compare 加 paren，因為 BitAnd/Compare 的優先級。
+    為保險起見直接包一層 ast.BoolOp 的方式不行，改成手動加 ()）。
+
+    實作上：對 BoolOp(And)，把 N 個 values reduce 成 BinOp(BitAnd, ..., Wrap(operand))，
+    每個 operand 用 ast.Expression 後再 ast.parse 重包，確保 unparse 時有括號。
+    """
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
+        op = ast.BitAnd() if isinstance(node.op, ast.And) else ast.BitOr()
+        new_values = [self.visit(v) for v in node.values]
+        # 對非單純 Name / Constant 的 operand 強制加括號 → 透過 ast.Expr 包再 unparse 不行；
+        # 直接靠 unparse 自動處理。如果碰到優先順序問題，retry 時補逐個 paren。
+        result: ast.AST = new_values[0]
+        for v in new_values[1:]:
+            result = ast.BinOp(left=result, op=op, right=v)
+        return ast.copy_location(result, node)
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
+        if isinstance(node.op, ast.Not):
+            new_operand = self.visit(node.operand)
+            return ast.copy_location(
+                ast.UnaryOp(op=ast.Invert(), operand=new_operand), node
+            )
+        return self.generic_visit(node)
+
+
+def _rewrite_expr_for_pandas(expr: str) -> str:
+    """
+    把 'close > ma20 and rsi14 < 70'
+    → '(close > ma20) & (rsi14 < 70)'
+    這樣 eval 出來的 Series 才會正確。
+    """
+    tree = ast.parse(expr, mode="eval")
+    new_tree = _BoolOpToBitOp().visit(tree)
+    ast.fix_missing_locations(new_tree)
+    return _unparse_with_paren_for_compare(new_tree.body)
+
+
+def _unparse_with_paren_for_compare(node: ast.AST) -> str:
+    """自己 unparse 一層：BinOp(BitAnd/BitOr) 兩側若是 Compare 強制加括號。"""
+    if isinstance(node, ast.BinOp):
+        op_sym = "&" if isinstance(node.op, ast.BitAnd) else (
+            "|" if isinstance(node.op, ast.BitOr) else ast.unparse(node.op)
+        )
+        left = _unparse_with_paren_for_compare(node.left)
+        right = _unparse_with_paren_for_compare(node.right)
+        if isinstance(node.left, (ast.Compare, ast.BoolOp, ast.BinOp)):
+            left = f"({left})"
+        if isinstance(node.right, (ast.Compare, ast.BoolOp, ast.BinOp)):
+            right = f"({right})"
+        return f"{left} {op_sym} {right}"
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+        operand = _unparse_with_paren_for_compare(node.operand)
+        if isinstance(node.operand, (ast.Compare, ast.BoolOp, ast.BinOp)):
+            operand = f"({operand})"
+        return f"~{operand}"
+    return ast.unparse(node)
+
+
+def _eval_custom_expression_mask(expr: str, df: pd.DataFrame) -> pd.Series:
+    """把 user 表達式轉成 boolean Series；先用 AST 改寫成 pandas-friendly。"""
+    try:
+        rewritten = _rewrite_expr_for_pandas(expr)
+    except Exception:
+        return pd.Series(False, index=df.index)
+
+    locals_ = {}
+    for col in _CUSTOM_ALLOWED_COLS:
+        if col in df.columns:
+            locals_[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            locals_[col] = pd.Series(np.nan, index=df.index, dtype="float64")
+    try:
+        result = eval(rewritten, {"__builtins__": {}}, locals_)
+    except Exception:
+        return pd.Series(False, index=df.index)
+    if isinstance(result, pd.Series):
+        return _safe_bool(result)
+    return pd.Series(bool(result), index=df.index)
+
+
+class CustomStrategy(_Base):
+    """
+    使用者自訂策略。兩種模式：
+    - 表單模式：entry/exit 為一串 CustomCondition，entry 取 AND、exit 取 OR
+    - 表達式模式：直接給字串，eval 成 boolean Series
+    """
+    def __init__(
+        self,
+        name: str,
+        entry_conditions: list[CustomCondition] | None = None,
+        exit_conditions: list[CustomCondition] | None = None,
+        *,
+        max_hold_days: int | None = None,
+        expression_entry: str | None = None,
+        expression_exit: str | None = None,
+    ) -> None:
+        ents = entry_conditions or []
+        exs = exit_conditions or []
+        if expression_entry:
+            entry_descr = [{"zh": f"表達式：{expression_entry}", "en": f"Expression: {expression_entry}"}]
+        else:
+            entry_descr = [{"zh": c.describe(), "en": c.describe()} for c in ents]
+        if expression_exit:
+            exit_descr = [{"zh": f"表達式：{expression_exit}", "en": f"Expression: {expression_exit}"}]
+        else:
+            exit_descr = [{"zh": c.describe(), "en": c.describe()} for c in exs]
+
+        super().__init__(
+            key="custom",
+            _label_i18n={"zh": name, "en": name},
+            _description_i18n={
+                "zh": "使用者自訂策略（form / expression）。",
+                "en": "User-defined strategy (form / expression).",
+            },
+            _timeframe_zh="中期",
+            _risk_label_zh="中",
+            _entry_rules_i18n=entry_descr,
+            _exit_rules_i18n=exit_descr,
+        )
+        self._entry_conds = ents
+        self._exit_conds = exs
+        self._max_hold = max_hold_days if (max_hold_days and max_hold_days > 0) else None
+        self._expr_entry = expression_entry or None
+        self._expr_exit = expression_exit or None
+
+    # ---- 內部：建 mask ----
+
+    def _entry_mask(self, df: pd.DataFrame) -> pd.Series:
+        if self._expr_entry:
+            return _eval_custom_expression_mask(self._expr_entry, df)
+        if not self._entry_conds:
+            return pd.Series(False, index=df.index)
+        m = pd.Series(True, index=df.index)
+        for c in self._entry_conds:
+            m = m & _safe_bool(c.to_mask(df))
+        return m
+
+    def _exit_mask(self, df: pd.DataFrame) -> pd.Series:
+        if self._expr_exit:
+            return _eval_custom_expression_mask(self._expr_exit, df)
+        if not self._exit_conds:
+            return pd.Series(False, index=df.index)
+        m = pd.Series(False, index=df.index)
+        for c in self._exit_conds:
+            m = m | _safe_bool(c.to_mask(df))
+        return m
+
+    def evaluate(self, snap: dict, enriched: pd.DataFrame) -> dict[str, Any]:
+        if enriched is None or enriched.empty:
+            return {
+                "entry_today": False, "exit_today": False, "score": 0.0,
+                "recommendation": "中性", "rule_hits": [], "rule_misses": [],
+                "exit_today_reasons": [],
+                "entry_rules_text": self.entry_rules_text,
+                "exit_rules_text": self.exit_rules_text,
+            }
+
+        em = self._entry_mask(enriched)
+        xm = self._exit_mask(enriched)
+        entry_today = bool(em.iloc[-1]) if len(em) else False
+        exit_today = bool(xm.iloc[-1]) if len(xm) else False
+
+        # 命中數：評估每個進場條件的「今日狀態」，做為策略命中度
+        hits: list[str] = []
+        misses: list[str] = []
+        if self._expr_entry:
+            # 表達式模式無法拆條件，整體看
+            if entry_today:
+                hits.append(self._expr_entry)
+            else:
+                misses.append(self._expr_entry)
+        else:
+            for c in self._entry_conds:
+                m = c.to_mask(enriched)
+                ok = bool(m.iloc[-1]) if len(m) else False
+                (hits if ok else misses).append(c.describe())
+
+        valid = max(1, len(hits) + len(misses))
+        score = (len(hits) / valid) * 10.0
+
+        # 觸發出場原因列表
+        exit_reasons: list[str] = []
+        if exit_today and not self._expr_exit:
+            for c in self._exit_conds:
+                m = c.to_mask(enriched)
+                if len(m) and bool(m.iloc[-1]):
+                    exit_reasons.append(c.describe())
+        elif exit_today and self._expr_exit:
+            exit_reasons.append(self._expr_exit)
+
+        return {
+            "entry_today": entry_today,
+            "exit_today": exit_today,
+            "score": score,
+            "recommendation": _tier_from_score(score),
+            "rule_hits": hits,
+            "rule_misses": misses,
+            "exit_today_reasons": exit_reasons,
+            "entry_rules_text": self.entry_rules_text,
+            "exit_rules_text": self.exit_rules_text,
+        }
+
+    def historical_signals(self, enriched: pd.DataFrame) -> dict[str, list[pd.Timestamp]]:
+        if enriched is None or enriched.empty:
+            return {"entries": [], "exits": []}
+        em = self._entry_mask(enriched)
+        xm = self._exit_mask(enriched)
+        return _clean_signals(em, xm, max_hold_days=self._max_hold)
+
+
+def make_custom_strategy(config: dict) -> CustomStrategy | None:
+    """
+    從 dict 配置建一個 CustomStrategy，若兩個模式都沒設任何有效條件 → 回 None。
+    config 結構：
+        {
+          "name": str,
+          "mode": "form" | "expression",
+          "entry_conditions": [{metric, op, against_kind, against}, ...],
+          "exit_conditions":  [...],
+          "expression_entry": str | None,
+          "expression_exit":  str | None,
+          "max_hold_days":    int | None,
+        }
+    """
+    if not config or not config.get("name"):
+        return None
+    mode = config.get("mode") or "form"
+    name = str(config["name"]).strip() or "My Strategy"
+    max_hold = config.get("max_hold_days") or None
+
+    if mode == "expression":
+        ee = (config.get("expression_entry") or "").strip()
+        xe = (config.get("expression_exit") or "").strip()
+        if not ee and not xe:
+            return None
+        # 任一表達式無效就拒絕
+        if ee:
+            ok, err = _validate_custom_expression(ee)
+            if not ok:
+                raise ValueError(f"entry expression invalid: {err}")
+        if xe:
+            ok, err = _validate_custom_expression(xe)
+            if not ok:
+                raise ValueError(f"exit expression invalid: {err}")
+        return CustomStrategy(
+            name, max_hold_days=max_hold,
+            expression_entry=ee or None, expression_exit=xe or None,
+        )
+
+    # form mode
+    raw_e = config.get("entry_conditions") or []
+    raw_x = config.get("exit_conditions") or []
+    e_conds = [
+        CustomCondition(c["metric"], c["op"], c["against_kind"], c["against"])
+        for c in raw_e
+    ]
+    x_conds = [
+        CustomCondition(c["metric"], c["op"], c["against_kind"], c["against"])
+        for c in raw_x
+    ]
+    e_conds = [c for c in e_conds if c.is_valid()]
+    x_conds = [c for c in x_conds if c.is_valid()]
+    if not e_conds and not x_conds:
+        return None
+    return CustomStrategy(name, e_conds, x_conds, max_hold_days=max_hold)
+
+
 # ---- 註冊表 ----
 
 
@@ -817,21 +1211,30 @@ _REGISTRY: dict[str, Strategy] = {
 }
 
 
-def list_strategies() -> list[Strategy]:
-    return list(_REGISTRY.values())
+def list_strategies(extra: list[Strategy] | None = None) -> list[Strategy]:
+    """回內建 5 套；給 extra 會接在後面。"""
+    out = list(_REGISTRY.values())
+    if extra:
+        out.extend(extra)
+    return out
 
 
-def get_strategy(key: str) -> Strategy:
+def get_strategy(key: str, extra: list[Strategy] | None = None) -> Strategy:
+    if extra:
+        for s in extra:
+            if s.key == key:
+                return s
     if key not in _REGISTRY:
         raise KeyError(f"未知策略：{key}；可用：{list(_REGISTRY.keys())}")
     return _REGISTRY[key]
 
 
-def strategy_choices() -> list[tuple[str, str]]:
+def strategy_choices(extra: list[Strategy] | None = None) -> list[tuple[str, str]]:
     """給 UI 用的 (key, label) 列表。會依當前語言動態生成。"""
+    strats = list_strategies(extra=extra)
     if get_lang() == "en":
-        return [(s.key, f"{s.label}  ·  {s.timeframe} / Risk: {s.risk_label}") for s in list_strategies()]
-    return [(s.key, f"{s.label}　·　{s.timeframe}／風險{s.risk_label}") for s in list_strategies()]
+        return [(s.key, f"{s.label}  ·  {s.timeframe} / Risk: {s.risk_label}") for s in strats]
+    return [(s.key, f"{s.label}　·　{s.timeframe}／風險{s.risk_label}") for s in strats]
 
 
 DEFAULT_STRATEGY_KEY = "long_trend"
