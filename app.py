@@ -19,8 +19,10 @@ import io
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -779,18 +781,62 @@ def _data_editor_stretch(
     num_rows: str | None = None,
     key: str | None = None,
 ) -> pd.DataFrame:
-    """舊版 Streamlit 不支援 width='stretch' 時退回 use_container_width。"""
+    """相容：無 width=stretch／column_config dtype 不符時自動降級。"""
     kw: dict = dict(
         data=data,
         hide_index=hide_index,
         num_rows=num_rows,
-        column_config=column_config or {},
         key=key,
     )
+    cfg = column_config or {}
+    if cfg:
+        kw["column_config"] = cfg
+
+    def _render(**extra) -> pd.DataFrame:
+        return st.data_editor(**kw, **extra)
+
     try:
-        return st.data_editor(**kw, width="stretch")
+        return _render(width="stretch")
     except TypeError:
-        return st.data_editor(**kw, use_container_width=True)
+        return _render(use_container_width=True)
+    except StreamlitAPIException:
+        # 多半是 column_config ↔ DataFrame dtype 不符（新版本檢查更嚴）
+        kw.pop("column_config", None)
+        try:
+            return _render(width="stretch")
+        except TypeError:
+            return _render(use_container_width=True)
+
+
+def _coerce_holdings_dataframe(df: pd.DataFrame | None) -> pd.DataFrame:
+    """強制 holdings 為 streamlit NumberColumn/TextColumn 可接受的 dtypes。"""
+    if df is None or df.empty:
+        return pd.DataFrame(
+            {
+                "symbol": pd.Series(dtype="object"),
+                "shares": pd.Series(dtype="float64"),
+                "avg_cost": pd.Series(dtype="float64"),
+                "note": pd.Series(dtype="object"),
+            }
+        )
+
+    out = df.copy()
+    for c in ("symbol", "shares", "avg_cost", "note"):
+        if c not in out.columns:
+            out[c] = np.nan if c in ("shares", "avg_cost") else ""
+
+    out = out[["symbol", "shares", "avg_cost", "note"]]
+
+    sym = pd.Series(out["symbol"], dtype=object).where(pd.notna(out["symbol"]), "").astype(object)
+    out["symbol"] = sym.astype(str)
+
+    nt = pd.Series(out["note"], dtype=object).where(pd.notna(out["note"]), "").astype(object)
+    out["note"] = nt.astype(str)
+
+    out["shares"] = pd.to_numeric(out["shares"], errors="coerce").astype(np.float64)
+    out["avg_cost"] = pd.to_numeric(out["avg_cost"], errors="coerce").astype(np.float64)
+    out.reset_index(drop=True, inplace=True)
+    return out
 
 
 # ----- 持股健檢 tab -----
@@ -817,10 +863,11 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
     st.caption(t("hold.intro"))
 
     # ---- 持股編輯（session state）----
+    # 每次進頁統一 coercion，確保 dtypes 給新版 Streamlit data_editor column_config（嚴檢相容）
     if "holdings_df" not in st.session_state:
-        st.session_state["holdings_df"] = pd.DataFrame(
-            {"symbol": [], "shares": [], "avg_cost": [], "note": []}
-        )
+        st.session_state["holdings_df"] = _coerce_holdings_dataframe(pd.DataFrame())
+    else:
+        st.session_state["holdings_df"] = _coerce_holdings_dataframe(st.session_state["holdings_df"])
     if "holdings_cash" not in st.session_state:
         st.session_state["holdings_cash"] = 0.0
 
@@ -848,7 +895,7 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
                 if "note" not in df_in.columns:
                     df_in["note"] = ""
                 df_in = df_in[["symbol", "shares", "avg_cost", "note"]].fillna({"note": ""})
-                st.session_state["holdings_df"] = df_in.reset_index(drop=True)
+                st.session_state["holdings_df"] = _coerce_holdings_dataframe(df_in.reset_index(drop=True))
                 st.success(t("hold.import_ok", n=len(df_in)))
                 # 清上一次健檢結果，避免 stale
                 if "holdings_result" in st.session_state:
@@ -866,20 +913,18 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
             )
     with cIO3:
         if st.button(t("hold.clear_btn"), use_container_width=True):
-            st.session_state["holdings_df"] = pd.DataFrame(
-                {"symbol": [], "shares": [], "avg_cost": [], "note": []}
-            )
+            st.session_state["holdings_df"] = _coerce_holdings_dataframe(pd.DataFrame())
             st.session_state.pop("holdings_result", None)
             st.toast(t("hold.clear_confirm"), icon="🧹")
 
     add_col1, add_col2 = st.columns([1, 2])
     with add_col1:
         if st.button(t("hold.add_blank_row"), help=t("hold.add_blank_hint"), key="_hold_add_row"):
-            base = st.session_state["holdings_df"].copy()
+            base = _coerce_holdings_dataframe(st.session_state["holdings_df"])
             new_row = pd.DataFrame(
-                [{"symbol": "", "shares": float("nan"), "avg_cost": float("nan"), "note": ""}]
+                [{"symbol": "", "shares": np.nan, "avg_cost": np.nan, "note": ""}]
             )
-            st.session_state["holdings_df"] = pd.concat([base, new_row], ignore_index=True)
+            st.session_state["holdings_df"] = _coerce_holdings_dataframe(pd.concat([base, new_row], ignore_index=True))
             st.rerun()
     with add_col2:
         st.caption(t("hold.add_blank_hint"))
@@ -891,13 +936,13 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
         column_config={
             "symbol": st.column_config.TextColumn(t("hold.col.symbol"), required=False),
             "shares": st.column_config.NumberColumn(t("hold.col.shares"), min_value=0.0, step=1.0),
-            "avg_cost": st.column_config.NumberColumn(t("hold.col.avg_cost"), min_value=0.0, format="%.4f"),
+            "avg_cost": st.column_config.NumberColumn(t("hold.col.avg_cost"), min_value=0.0, step=1e-4),
             "note": st.column_config.TextColumn(t("hold.col.note")),
         },
         hide_index=True,
         key="_hold_editor",
     )
-    st.session_state["holdings_df"] = edited
+    st.session_state["holdings_df"] = _coerce_holdings_dataframe(edited)
     st.caption(t("hold.editor_caption"))
 
     cash_col, run_col = st.columns([1, 1])
@@ -1172,8 +1217,13 @@ def main() -> None:
               flex-wrap: nowrap !important;
           }
           button[data-baseweb="tab"] { font-size: 0.85rem !important; padding: 0.4rem 0.6rem !important; }
-          /* sidebar 開啟時佔滿 90% 寬避免擠壓 */
-          section[data-testid="stSidebar"] { min-width: 90% !important; }
+          /* Sidebar：先前 min-width 90% 會讓浮層幾乎蓋滿螢幕、主內容看不到 — 改為限寬上浮層 */
+          section[data-testid="stSidebar"] {
+              width: min(360px, 88vw) !important;
+              min-width: 0 !important;
+              max-width: 88vw !important;
+              box-sizing: border-box !important;
+          }
         }
         </style>
         """,
