@@ -76,8 +76,12 @@ streamlit run app.py
 預設會跑「台股 中型 ~50 檔」清單；想跑全市場：
 
 1. Sidebar → 股票池規模選「全 TW 上市」或「全 TW 上市+上櫃」
-2. 按「🔄 同步台股全市場清單」（首次 ~30 秒）
-3. 等指標計算完（首次 5–15 分鐘，之後走 disk cache）
+2. 等指標計算完（首次 5–15 分鐘，之後走 disk cache）
+
+> 全市場名單（~2300 檔）已內建在 `data/universe_tw_*.json`，不需要再按同步。
+> 若要更新最新上市/上櫃名單，本地端執行 `python tools/sync_tw_universe.py` 後 commit + push 即可。
+>
+> ⚠️ 雲端部署備註：TWSE 的 `isin.twse.com.tw` 憑證缺 Subject Key Identifier，OpenSSL 3.x（多數 Linux 雲）會拒絕；sync 腳本已內建 unverified retry fallback，但建議直接用 repo 內建的 JSON。
 
 ---
 

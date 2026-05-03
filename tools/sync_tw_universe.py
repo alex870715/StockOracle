@@ -39,13 +39,40 @@ URL_OTC = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"  # 上櫃
 
 KEEP_SECTIONS = {"股票", "ETF", "受益證券", "ETN"}
 
+# TWSE 的 SSL 憑證少了 Subject Key Identifier 擴展，OpenSSL 3.x（Linux 雲端常見）
+# 嚴格模式會拒絕；本地 macOS LibreSSL 較寬鬆所以沒事。第一次撞牆後設為 True，
+# 之後直接 verify=False，避免每個 URL 都重撞一次。
+_TWSE_SSL_BROKEN = False
+
 
 def fetch(url: str) -> str:
-    r = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
+    global _TWSE_SSL_BROKEN
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; StockOracle/1.0)"}
+    if _TWSE_SSL_BROKEN:
+        r = _fetch_unverified(url, headers)
+    else:
+        try:
+            r = requests.get(url, timeout=60, headers=headers)
+        except requests.exceptions.SSLError as e:
+            # TWSE 是公開讀取頁面、無敏感資訊，可接受降級到 unverified retry。
+            print(f"[警告] TWSE SSL 驗證失敗，降級到 unverified retry: {e}", flush=True)
+            _TWSE_SSL_BROKEN = True
+            r = _fetch_unverified(url, headers)
     # TWSE 頁面為 big5；用 ms950 對 big5 superset 解較不易壞字
     r.encoding = "ms950"
     r.raise_for_status()
     return r.text
+
+
+def _fetch_unverified(url: str, headers: dict) -> requests.Response:
+    """關掉 SSL 驗證再抓一次；同時壓掉 urllib3 的 InsecureRequestWarning。"""
+    try:
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+    return requests.get(url, timeout=60, headers=headers, verify=False)
 
 
 _CODE_RE = re.compile(r"^(\d{4,6}[A-Z]?)[\s\u3000]+(.+)$")

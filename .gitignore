@@ -34,10 +34,13 @@ coverage.xml
 
 # ----- 專案資料 / 快取（請勿上傳） -----
 .cache/
-data/universe_tw_*.json
 data/yf_v2/
 *.parquet
 *.csv
+# 註：data/universe_tw_*.json 刻意 commit 進 repo，
+# 雲端部署（Streamlit Cloud / HF Spaces / Render…）的 OpenSSL 3.x
+# 會拒絕 TWSE 缺 SKI 的憑證，cold start 跑同步會掛；
+# 直接內建 ~60KB 名單、需要更新時手動執行 sync 後再 push。
 
 # ----- 輸出 / 日誌 -----
 *.log
