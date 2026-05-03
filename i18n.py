@@ -495,12 +495,22 @@ _DICT: dict[str, dict[str, str]] = {
     "tabs.holdings": {"zh": "🏥 持股健檢", "en": "🏥 Portfolio Health"},
     "hold.section_title": {"zh": "🩺 持股健檢", "en": "🩺 Portfolio Health Check"},
     "hold.intro": {
-        "zh": "輸入你的持股、均價、股數，系統自動抓現價、算損益，並用既有 5 套策略 + 多因子指標給體檢分數與建議。資料只存在這個 session（重新整理會清掉），可以匯出 / 匯入 CSV 保留。",
-        "en": "Enter your holdings (symbol, avg cost, shares). System fetches live price, computes P&L, and uses the 5 built-in strategies + multi-factor indicators to score health and give advice. Data is session-only (clears on refresh); use CSV import/export to persist.",
+        "zh": "不一定要用 CSV：在下方表格『手動編輯』代號／股數／均價，或選 CSV 後按『確認載入 CSV』亦可。資料只存在這個 session（重新整理會清），需要可匯出 CSV 備份。",
+        "en": "CSV is optional: edit symbol / shares / avg cost inline, or upload a CSV and click 'Import CSV'. Data is session-only (cleared on refresh); export CSV anytime to backup.",
     },
     "hold.editor_caption": {
-        "zh": "下方表格可直接編輯／新增列／刪除列；現價會即時抓取。",
-        "en": "Edit / add / delete rows directly. Live price is fetched on the fly.",
+        "zh": "不需要 CSV：按「新增空白列」或表格左下的 ➕ 增加列手動填入代號／股數／均價；台股輸入 2330 亦可（會自動加上 .TW）。",
+        "en": "No CSV required — click 'Add blank row' or the ➕ under the editor to append rows manually. For TW equities you can enter 2330 (auto-append .TW).",
+    },
+    "hold.import_confirm": {"zh": "📥 確認載入 CSV", "en": "📥 Import CSV"},
+    "hold.import_help_button": {
+        "zh": "選好 CSV 後按此載入表格（可避免重複自動匯入）。",
+        "en": "Select a CSV then click — avoids repeated auto-import on every rerun.",
+    },
+    "hold.add_blank_row": {"zh": "➕ 新增空白列（手動建檔）", "en": "➕ Add blank row"},
+    "hold.add_blank_hint": {
+        "zh": "適合不使用 Excel：一列一標的填完再跑健檢。",
+        "en": "For manual entry — one symbol per row, then Run health check.",
     },
     "hold.col.symbol": {"zh": "代號", "en": "Symbol"},
     "hold.col.shares": {"zh": "股數", "en": "Shares"},

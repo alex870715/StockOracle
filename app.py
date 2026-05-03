@@ -15,6 +15,7 @@ StockOracle 網頁介面（v2）：
 
 from __future__ import annotations
 
+import io
 import sys
 from pathlib import Path
 
@@ -764,7 +765,32 @@ def _render_cond_block(
             "against_kind": "metric", "against": "ma20",
         })
 
-    cfg[key] = new_conds
+        cfg[key] = new_conds
+
+
+# ----- Streamlit 版本相容（持股健檢／舊版無 width=stretch） -----
+
+
+def _data_editor_stretch(
+    data: pd.DataFrame,
+    *,
+    column_config=None,
+    hide_index: bool = False,
+    num_rows: str | None = None,
+    key: str | None = None,
+) -> pd.DataFrame:
+    """舊版 Streamlit 不支援 width='stretch' 時退回 use_container_width。"""
+    kw: dict = dict(
+        data=data,
+        hide_index=hide_index,
+        num_rows=num_rows,
+        column_config=column_config or {},
+        key=key,
+    )
+    try:
+        return st.data_editor(**kw, width="stretch")
+    except TypeError:
+        return st.data_editor(**kw, use_container_width=True)
 
 
 # ----- 持股健檢 tab -----
@@ -804,9 +830,17 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
             t("hold.import_csv"), type=["csv"],
             help=t("hold.import_help"), key="_hold_csv_up",
         )
-        if up is not None:
+        # 不可用 session_state["_hold_csv_up"]=None — 這是 widget key，會直接觸發 StreamlitAPIException
+        # 改用「確認匯入」按鈕，只在點擊時讀取 bytes，並避免無限重複匯入
+        if up is not None and st.button(
+            t("hold.import_confirm"),
+            help=t("hold.import_help_button"),
+            key="_hold_csv_confirm",
+            use_container_width=True,
+        ):
             try:
-                df_in = pd.read_csv(up)
+                raw = up.getvalue()
+                df_in = pd.read_csv(io.BytesIO(raw))
                 df_in.columns = [c.strip().lower() for c in df_in.columns]
                 need = {"symbol", "shares", "avg_cost"}
                 if not need.issubset(df_in.columns):
@@ -816,7 +850,9 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
                 df_in = df_in[["symbol", "shares", "avg_cost", "note"]].fillna({"note": ""})
                 st.session_state["holdings_df"] = df_in.reset_index(drop=True)
                 st.success(t("hold.import_ok", n=len(df_in)))
-                st.session_state["_hold_csv_up"] = None  # 防止重複觸發
+                # 清上一次健檢結果，避免 stale
+                if "holdings_result" in st.session_state:
+                    del st.session_state["holdings_result"]
             except Exception as e:
                 st.error(t("hold.import_fail", err=str(e)))
     with cIO2:
@@ -833,15 +869,27 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
             st.session_state["holdings_df"] = pd.DataFrame(
                 {"symbol": [], "shares": [], "avg_cost": [], "note": []}
             )
+            st.session_state.pop("holdings_result", None)
             st.toast(t("hold.clear_confirm"), icon="🧹")
 
+    add_col1, add_col2 = st.columns([1, 2])
+    with add_col1:
+        if st.button(t("hold.add_blank_row"), help=t("hold.add_blank_hint"), key="_hold_add_row"):
+            base = st.session_state["holdings_df"].copy()
+            new_row = pd.DataFrame(
+                [{"symbol": "", "shares": float("nan"), "avg_cost": float("nan"), "note": ""}]
+            )
+            st.session_state["holdings_df"] = pd.concat([base, new_row], ignore_index=True)
+            st.rerun()
+    with add_col2:
+        st.caption(t("hold.add_blank_hint"))
+
     # 編輯器
-    edited = st.data_editor(
+    edited = _data_editor_stretch(
         st.session_state["holdings_df"],
         num_rows="dynamic",
-        width="stretch",
         column_config={
-            "symbol": st.column_config.TextColumn(t("hold.col.symbol"), required=True),
+            "symbol": st.column_config.TextColumn(t("hold.col.symbol"), required=False),
             "shares": st.column_config.NumberColumn(t("hold.col.shares"), min_value=0.0, step=1.0),
             "avg_cost": st.column_config.NumberColumn(t("hold.col.avg_cost"), min_value=0.0, format="%.4f"),
             "note": st.column_config.TextColumn(t("hold.col.note")),
@@ -865,8 +913,15 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
         run_btn = st.button(t("hold.run_btn"), type="primary", use_container_width=True)
 
     df_h = edited.copy()
-    df_h = df_h[df_h["symbol"].astype(str).str.strip().ne("")]
-    df_h["symbol"] = df_h["symbol"].astype(str).str.strip().map(normalize_yahoo_symbol)
+    for req in ("symbol", "shares", "avg_cost"):
+        if req not in df_h.columns:
+            st.error(("Missing column: " if get_lang() == "en" else "缺少欄位：") + req)
+            return
+    df_h["symbol"] = df_h["symbol"].fillna("").astype(str).str.strip()
+    df_h = df_h[df_h["symbol"].ne("")]
+    df_h["symbol"] = df_h["symbol"].map(normalize_yahoo_symbol)
+    df_h["shares"] = pd.to_numeric(df_h["shares"], errors="coerce")
+    df_h["avg_cost"] = pd.to_numeric(df_h["avg_cost"], errors="coerce")
     df_h = df_h[(df_h["shares"].fillna(0) > 0) & (df_h["avg_cost"].fillna(0) > 0)]
 
     if df_h.empty:
@@ -998,10 +1053,30 @@ def _render_holdings_tab(period: str, dmode: str) -> None:
     sty = sty.format({c: "{:,.2f}" for c in money_cols if c in df_show.columns}, na_rep="—")
     sty = sty.format({c: "{:+.2f}%" for c in pct_cols if c in df_show.columns}, na_rep="—")
     sty = sty.format({t("hold.col.shares"): "{:,.0f}", t("hold.col.health"): "{:.0f}"})
-    sty = sty.applymap(_color_pnl, subset=[t("hold.col.pnl"), t("hold.col.pnl_pct")])
-    sty = sty.applymap(_color_health, subset=[t("hold.col.health")])
+    pn_cols = [c for c in (t("hold.col.pnl"), t("hold.col.pnl_pct")) if c in df_show.columns]
+    hh_cols = [c for c in (t("hold.col.health"),) if c in df_show.columns]
+    if pn_cols:
+        if hasattr(sty, "map"):
+            sty = sty.map(_color_pnl, subset=pn_cols)
+        else:
+            sty = sty.applymap(_color_pnl, subset=pn_cols)
+    if hh_cols:
+        if hasattr(sty, "map"):
+            sty = sty.map(_color_health, subset=hh_cols)
+        else:
+            sty = sty.applymap(_color_health, subset=hh_cols)
 
-    st.dataframe(sty, width="stretch", hide_index=True)
+    try:
+        try:
+            st.dataframe(sty, width="stretch", hide_index=True)
+        except TypeError:
+            st.dataframe(sty, use_container_width=True, hide_index=True)
+    except Exception:
+        try:
+            st.dataframe(df_show, width="stretch", hide_index=True)
+        except TypeError:
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
+
 
     # ---- 個別持股展望 ----
     with st.expander(t("hold.detail_title"), expanded=False):
