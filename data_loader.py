@@ -309,10 +309,12 @@ def fetch_watchlist(
     use_cache: bool = True,
     ttl_secs: int = _DEFAULT_TTL_SECS,
     max_workers: int = 8,
+    priority_symbols: Iterable[str] | None = None,
     progress_cb: Callable[[int, int, str, bool], None] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
     """
     並行抓取多檔；回傳 (成功 dict, 失敗代號清單)。
+    priority_symbols：若為清單內且亦在 symbols 中，會先抓完這些再抓其餘（利於 UI 優先顯示選中標的）。
     progress_cb(i, total, symbol, ok) 在每檔完成後被呼叫。
     """
     syms_norm = [normalize_yahoo_symbol(s) for s in symbols if s and str(s).strip()]
@@ -324,36 +326,57 @@ def fetch_watchlist(
     if total == 0:
         return out, failed
 
-    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, total))) as ex:
-        futs = {
-            ex.submit(
-                fetch_history,
-                s,
-                period=period,
-                interval=interval,
-                auto_adjust=auto_adjust,
-                use_cache=use_cache,
-                ttl_secs=ttl_secs,
-            ): s
-            for s in syms_norm
-        }
-        for i, fut in enumerate(as_completed(futs), 1):
-            sym = futs[fut]
-            ok = False
-            try:
-                df = fut.result()
-                if df is not None and not df.empty:
-                    out[sym] = df
-                    ok = True
-                else:
-                    failed.append(sym)
-            except Exception:
-                failed.append(sym)
-            if progress_cb:
+    prio: list[str] = []
+    seen_prio: set[str] = set()
+    for s in priority_symbols or []:
+        sn = normalize_yahoo_symbol(s)
+        if sn and sn in syms_norm and sn not in seen_prio:
+            prio.append(sn)
+            seen_prio.add(sn)
+    rest = [s for s in syms_norm if s not in seen_prio]
+    ordered = prio + rest
+
+    def _run_batch(batch: list[str], prog_base: int, prog_total: int) -> None:
+        if not batch:
+            return
+        n_batch = len(batch)
+        workers = min(max_workers, max(1, n_batch))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {
+                ex.submit(
+                    fetch_history,
+                    s,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=auto_adjust,
+                    use_cache=use_cache,
+                    ttl_secs=ttl_secs,
+                ): s
+                for s in batch
+            }
+            for j, fut in enumerate(as_completed(futs), 1):
+                sym = futs[fut]
+                ok = False
                 try:
-                    progress_cb(i, total, sym, ok)
+                    df = fut.result()
+                    if df is not None and not df.empty:
+                        out[sym] = df
+                        ok = True
+                    else:
+                        failed.append(sym)
                 except Exception:
-                    pass
+                    failed.append(sym)
+                if progress_cb:
+                    try:
+                        progress_cb(prog_base + j, prog_total, sym, ok)
+                    except Exception:
+                        pass
+
+    prog_den = max(1, total)
+    if prio:
+        _run_batch(prio, 0, prog_den)
+    if rest:
+        _run_batch(rest, len(prio), prog_den)
 
     return out, failed
 

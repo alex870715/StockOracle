@@ -160,8 +160,8 @@ _DICT: dict[str, dict[str, str]] = {
     },
     "sidebar.sync_tw": {"zh": "🔄 同步台股全市場清單", "en": "🔄 Sync TW universe"},
     "sidebar.sync_tw_help": {
-        "zh": "呼叫 TWSE 公開頁，產生白名單 JSON",
-        "en": "Scrape TWSE public pages and generate a whitelist JSON",
+        "zh": "從 TWSE 公開頁產生／覆寫白名單 JSON；**不需每天按**，僅在要更新上市／上櫃名單時執行即可。",
+        "en": "Scrape TWSE to (re)generate JSON. **Not daily**—run when you need an updated listed/OTC roster.",
     },
     "sidebar.sync_status_btn": {"zh": "📋 顯示同步狀態", "en": "📋 Show sync status"},
     "sidebar.sync_running": {"zh": "正從 TWSE 抓取上市／上櫃清單…", "en": "Fetching listed/OTC universe from TWSE…"},
@@ -318,6 +318,10 @@ _DICT: dict[str, dict[str, str]] = {
     "app.fetch_status": {
         "zh": "**{cur}/{total}** · {phase} · {sym}",
         "en": "**{cur}/{total}** · {phase} · {sym}",
+    },
+    "app.report_from_cache": {
+        "zh": "已從本機載入上次排名（略過整包下載）。按頂部「重新計算」可強制連網更新。",
+        "en": "Loaded last rankings from disk (skipped bulk download). Use top **Refresh** to refetch.",
     },
 
     # ====== Chart（個股圖 · K 區間／視窗）======

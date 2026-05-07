@@ -9,6 +9,9 @@
 過濾規則：只保留 區塊「股票」「ETF」「受益證券」（後者主要是 REITs / 信託），
 並只收純數字 4–6 碼（含可能的單字尾大寫，例如特別股 1101A 也保留）。
 
+注意：**不必每天同步**。Repo 已內建 `data/universe_tw_*.json`；只在要更新上市／上櫃名單
+（新股掛牌、下市等）時執行本腳本或側欄同步即可。
+
 輸出檔：
 - data/universe_tw_listed.json
 - data/universe_tw_otc.json
@@ -84,7 +87,8 @@ _KEEP_CFI_PREFIX = ("E", "C")
 
 def parse(html: str, suffix: str) -> dict[str, str]:
     """回傳 {代號+suffix: 名稱}；用「市場別=上市/上櫃」+「CFICode 以 E 開頭」雙條件過濾。"""
-    tables = pd.read_html(StringIO(html))
+    # TWSE HTML 偶有格式問題：先 lxml、再 html5lib（見 requirements.txt）
+    tables = pd.read_html(StringIO(html), flavor=["lxml", "html5lib"])
     if not tables:
         return {}
     df = tables[0]

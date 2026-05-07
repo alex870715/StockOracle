@@ -262,6 +262,7 @@ def run_full_report(
     *,
     period: str = "1y",
     market_for_bench: str | None = None,
+    priority_symbols: Iterable[str] | None = None,
     progress_cb: Callable[[int, int, str, bool], None] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str], dict]:
     """
@@ -291,9 +292,13 @@ def run_full_report(
             except Exception:
                 pass
 
-        frames, failed = fetch_watchlist(syms, period=period, progress_cb=_fetch_cb)
+        frames, failed = fetch_watchlist(
+            syms, period=period, priority_symbols=priority_symbols, progress_cb=_fetch_cb,
+        )
     else:
-        frames, failed = fetch_watchlist(syms, period=period, progress_cb=None)
+        frames, failed = fetch_watchlist(
+            syms, period=period, priority_symbols=priority_symbols, progress_cb=None,
+        )
 
     rows: list[dict] = []
     for j, (sym, df) in enumerate(frames.items(), 1):

@@ -71,6 +71,7 @@ from strategies import (  # noqa: E402
     list_strategies,
     make_custom_strategy,
 )
+from report_store import clear_saved_reports, load_report, save_report  # noqa: E402
 from symbol_meta import DISPLAY_MODES, format_symbol, reload_names  # noqa: E402
 from universe import (  # noqa: E402
     UNIVERSE_SIZES,
@@ -1595,12 +1596,14 @@ def main() -> None:
                 st.session_state["cache_buster"] += 1
             if st.button(t("sidebar.clear_cache_btn")):
                 n = clear_cache()
+                n_r = clear_saved_reports()
                 st.cache_data.clear()
                 st.session_state["cache_buster"] += 1
-                st.success(t("sidebar.clear_cache_done", n=n))
+                st.success(t("sidebar.clear_cache_done", n=n + n_r))
 
     if refresh_btn:
         st.session_state["cache_buster"] += 1
+        clear_saved_reports()
 
     symbols, source_label = _resolve_symbols(market_key, size, custom)
 
@@ -1610,34 +1613,61 @@ def main() -> None:
         or st.session_state.get("_last_signature") != (tuple(symbols), period)
     )
     if needs_run:
-        prog = st.progress(0)
-        cap = st.empty()
-        n_tot = len(symbols)
-        spinner_msg = t("app.fetch_spin", n=n_tot)
+        sig = (tuple(symbols), period)
+        cached_pack: tuple | None = None
+        if not refresh_btn:
+            cached_pack = load_report(sig[0], sig[1])
+        if cached_pack is not None:
+            all_df, short_df, failed, meta = cached_pack
+            prog = st.progress(1.0)
+            cap = st.empty()
+            cap.caption(t("app.report_from_cache"))
+            prog.empty()
+            cap.empty()
+        else:
+            prog = st.progress(0)
+            cap = st.empty()
+            n_tot = len(symbols)
+            spinner_msg = t("app.fetch_spin", n=n_tot)
+            priority_syms: list[str] = []
+            _sel = str(st.session_state.get("selected_symbol") or "").strip()
+            if _sel:
+                priority_syms.append(_sel)
 
-        def _progress_cb(cur: int, tot: int, sym: str, _ok: bool) -> None:
-            prog.progress(min(max(0.0, cur / float(max(1, tot))), 1.0))
-            short = sym if len(sym) <= 26 else sym[:22] + "…"
-            phase_key = (
-                "app.fetch_phase_dl" if n_tot <= 0 or cur <= n_tot else "app.fetch_phase_calc"
-            )
-            cap.caption(
-                t("app.fetch_status", cur=int(cur), total=int(tot), sym=short, phase=t(phase_key))
-            )
-
-        try:
-            with st.spinner(spinner_msg):
-                all_df, short_df, failed, meta = run_full_report(
-                    list(symbols), period=period, progress_cb=_progress_cb,
+            def _progress_cb(cur: int, tot: int, sym: str, _ok: bool) -> None:
+                prog.progress(min(max(0.0, cur / float(max(1, tot))), 1.0))
+                short = sym if len(sym) <= 26 else sym[:22] + "…"
+                phase_key = (
+                    "app.fetch_phase_dl" if n_tot <= 0 or cur <= n_tot else "app.fetch_phase_calc"
                 )
-        except Exception as e:
-            st.error(("Run failed: " if get_lang() == "en" else "執行失敗：") + str(e))
-            prog.empty()
-            cap.empty()
-            return
-        finally:
-            prog.empty()
-            cap.empty()
+                cap.caption(
+                    t("app.fetch_status", cur=int(cur), total=int(tot), sym=short, phase=t(phase_key))
+                )
+
+            try:
+                with st.spinner(spinner_msg):
+                    all_df, short_df, failed, meta = run_full_report(
+                        list(symbols),
+                        period=period,
+                        priority_symbols=priority_syms or None,
+                        progress_cb=_progress_cb,
+                    )
+            except Exception as e:
+                st.error(("Run failed: " if get_lang() == "en" else "執行失敗：") + str(e))
+                prog.empty()
+                cap.empty()
+                return
+            finally:
+                prog.empty()
+                cap.empty()
+            save_report(
+                sig[0],
+                sig[1],
+                all_df=all_df,
+                short_df=short_df,
+                failed=failed,
+                meta=meta,
+            )
         st.session_state.update(
             {
                 "all_df": all_df,
